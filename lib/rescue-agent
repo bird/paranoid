@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Minimal rescue agent — one tool (bash), one inference endpoint, no dependencies."""
+
+import json, subprocess, sys, urllib.request, urllib.error
+
+API = None
+MODEL = None
+
+TOOL = {
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": "Execute a bash command and return its output.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string", "description": "The command to run"}},
+            "required": ["command"],
+        },
+    },
+}
+
+def chat(messages):
+    body = json.dumps({"model": MODEL, "messages": messages, "tools": [TOOL], "tool_choice": "auto"}).encode()
+    req = urllib.request.Request(f"{API}/v1/chat/completions",
+        data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read())
+    except urllib.error.URLError as e:
+        return {"error": str(e)}
+
+def run_bash(cmd):
+    try:
+        r = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True, timeout=60)
+        out = r.stdout + r.stderr
+        return out[:8000] or "(no output)"
+    except subprocess.TimeoutExpired:
+        return "(command timed out after 60s)"
+
+SYSTEM = """You are an agent inside an Alpine Linux VM (busybox).
+CRITICAL: There is NO bash. Use /bin/sh or just `sh -c`. All commands run via /bin/sh.
+You have one tool: bash (which actually runs /bin/sh). Use it to accomplish tasks.
+Install packages with: doas apk add <pkg>
+You have root via doas. Python 3 is available. curl is available.
+Network goes through WireGuard VPN. Local inference API at http://inference.local:11434.
+Be concise. Think step by step. Check results before proceeding."""
+
+def agent_loop(task):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": task},
+    ]
+    for _ in range(50):
+        resp = chat(messages)
+        if "error" in resp:
+            print(f"API error: {resp['error']}", file=sys.stderr)
+            return
+        choice = resp["choices"][0]
+        msg = choice["message"]
+        messages.append(msg)
+
+        if msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                cmd = json.loads(tc["function"]["arguments"]).get("command", "")
+                print(f"\033[33m$ {cmd}\033[0m")
+                output = run_bash(cmd)
+                print(output)
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": output})
+        else:
+            if msg.get("content"):
+                print(msg["content"])
+            if choice.get("finish_reason") != "tool_calls":
+                return
+
+def main():
+    global API, MODEL
+    API = "http://inference.local:11434"
+    MODEL = "default"
+
+    # Auto-detect model
+    try:
+        with urllib.request.urlopen(f"{API}/v1/models", timeout=5) as r:
+            models = json.loads(r.read())
+            if models.get("models"):
+                MODEL = models["models"][0]["model"]
+            elif models.get("data"):
+                MODEL = models["data"][0]["id"]
+    except Exception:
+        pass
+
+    if len(sys.argv) > 1:
+        agent_loop(" ".join(sys.argv[1:]))
+    else:
+        print(f"rescue-agent — minimal AI agent (model: {MODEL})")
+        print("Type a task, or Ctrl-D to exit.\n")
+        while True:
+            try:
+                task = input("\033[1m> \033[0m")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if task.strip():
+                agent_loop(task.strip())
+                print()
+
+if __name__ == "__main__":
+    main()

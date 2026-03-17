@@ -1,0 +1,2479 @@
+#!/usr/bin/env bash
+# paranoid — QEMU microVM agent sandboxes with WireGuard-only networking
+# Each VM runs in its own network namespace with nftables kill switch.
+# Zero connectivity outside the WireGuard tunnel.
+
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+readonly PROG="paranoid"
+
+# Paths — use SUDO_USER's home if running under sudo
+_real_home() {
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        getent passwd "$SUDO_USER" | cut -d: -f6
+    else
+        echo "$HOME"
+    fi
+}
+readonly REAL_HOME="$(_real_home)"
+readonly CONFIG_DIR="${REAL_HOME}/.config/paranoid"
+readonly DATA_DIR="${REAL_HOME}/.local/share/paranoid"
+readonly MULLVAD_CONF="${CONFIG_DIR}/mullvad.conf"
+readonly SERVERS_CACHE="${CONFIG_DIR}/servers.json"
+readonly BASE_DIR="${DATA_DIR}/base"
+readonly VMS_DIR="${DATA_DIR}/vms"
+readonly VMLINUZ="${BASE_DIR}/vmlinuz"
+readonly BASE_IMAGE="${BASE_DIR}/alpine-base.qcow2"
+
+# Defaults
+readonly DEFAULT_RAM=512
+readonly DEFAULT_CPUS=2
+readonly NS_PREFIX="paranoid"
+readonly TAP_PREFIX="tap"
+readonly WG_PREFIX="wg"
+readonly VM_SUBNET="10.155"  # We'll use 10.155.X.0/24 per VM
+readonly VETH_SUBNET="10.99"  # We'll use 10.99.X.0/30 per VM for inference pinhole
+readonly MULLVAD_DNS="10.64.0.1"
+readonly INFERENCE_PORT=11434  # Port the VM sees for inference (on TAP gateway)
+readonly CONTROL_PORT=9111    # Control plane API on TAP gateway
+readonly _SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+_find_companion() {
+    local name="$1"
+    for d in "$_SCRIPT_DIR" "${_SCRIPT_DIR}/../lib" "${_SCRIPT_DIR}/../lib/paranoid" "/usr/local/lib/paranoid"; do
+        [[ -f "$d/$name" ]] && echo "$d/$name" && return
+    done
+}
+readonly CONTROLPLANE_BIN="$(_find_companion paranoid-controlplane)"
+readonly SERVERS_MAX_AGE=86400  # 24h in seconds
+readonly SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR)
+
+# Encryption
+readonly VAULT_ENC="${CONFIG_DIR}/vault.key.enc"
+readonly VAULT_SALT="${CONFIG_DIR}/vault.salt"
+readonly CIPHER="aes-256-cbc"
+readonly KDF_ITER=600000  # PBKDF2 iterations
+
+# Alpine version for base image
+readonly ALPINE_ARCH="x86_64"
+# Alpine version resolved dynamically from latest-stable manifest
+
+# Colors
+if [[ -t 1 ]]; then
+    readonly RED=$'\033[0;31m'
+    readonly GREEN=$'\033[0;32m'
+    readonly YELLOW=$'\033[0;33m'
+    readonly BLUE=$'\033[0;34m'
+    readonly BOLD=$'\033[1m'
+    readonly RESET=$'\033[0m'
+else
+    readonly RED="" GREEN="" YELLOW="" BLUE="" BOLD="" RESET=""
+fi
+
+# --- Utility functions ---
+
+die() { echo "${RED}ERROR: $*${RESET}" >&2; exit 1; }
+warn() { echo "${YELLOW}WARN: $*${RESET}" >&2; }
+info() { echo "${GREEN}:: $*${RESET}"; }
+debug() { [[ "${PARANOID_DEBUG:-0}" == "1" ]] && echo "${BLUE}DEBUG: $*${RESET}" >&2 || true; }
+
+# --- Encryption / vault functions ---
+
+# Prompt for passphrase (or use env var)
+_get_passphrase() {
+    local purpose="${1:-unlock vault}"
+    if [[ -n "${PARANOID_PASSPHRASE:-}" ]]; then
+        echo "$PARANOID_PASSPHRASE"
+        return
+    fi
+    local pass
+    read -rsp "${BOLD}Passphrase (${purpose}): ${RESET}" pass </dev/tty
+    echo "" >/dev/tty
+    [[ -n "$pass" ]] || die "Empty passphrase"
+    echo "$pass"
+}
+
+# Initialize the vault: generate a 256-bit master key, encrypt it with user passphrase
+_vault_init() {
+    if [[ -f "$VAULT_ENC" ]]; then
+        warn "Vault already exists at $VAULT_ENC"
+        return 0
+    fi
+
+    info "Creating encryption vault..."
+    local pass pass2
+    pass=$(_get_passphrase "new vault passphrase")
+    if [[ -z "${PARANOID_PASSPHRASE:-}" ]]; then
+        # Only confirm interactively — env var is already intentional
+        read -rsp "${BOLD}Confirm passphrase: ${RESET}" pass2 </dev/tty
+        echo "" >/dev/tty
+        [[ "$pass" == "$pass2" ]] || die "Passphrases don't match"
+    fi
+
+    local master_key
+    master_key=$(openssl rand -hex 32)
+
+    # Encrypt master key with passphrase via PBKDF2 (pass via stdin, not cmdline)
+    echo "$master_key" | openssl enc -${CIPHER} -pbkdf2 -iter ${KDF_ITER} \
+        -pass "fd:3" -out "$VAULT_ENC" 3< <(echo -n "$pass") 2>/dev/null \
+        || die "Failed to create vault"
+    chmod 600 "$VAULT_ENC"
+
+    info "Vault created — remember your passphrase!"
+}
+
+# Unlock vault: decrypt master key with passphrase, return it
+# Caches in PARANOID_MASTER_KEY env for the duration of the process
+_vault_unlock() {
+    if [[ -n "${_CACHED_MASTER_KEY:-}" ]]; then
+        echo "$_CACHED_MASTER_KEY"
+        return
+    fi
+    [[ -f "$VAULT_ENC" ]] || die "No vault found. Run '$PROG setup' first."
+
+    local pass
+    pass=$(_get_passphrase "unlock vault")
+
+    local master_key
+    master_key=$(openssl enc -${CIPHER} -d -pbkdf2 -iter ${KDF_ITER} \
+        -pass "fd:3" -in "$VAULT_ENC" 3< <(echo -n "$pass") 2>/dev/null | tr -d '\0') \
+        || die "Wrong passphrase or corrupted vault"
+    [[ -n "$master_key" ]] || die "Wrong passphrase or corrupted vault"
+
+    # Validate it looks like a hex key
+    [[ "$master_key" =~ ^[0-9a-f]{64}$ ]] || die "Vault decryption produced invalid key"
+
+    # Cache for this process (NOT exported — don't leak to children)
+    _CACHED_MASTER_KEY="$master_key"
+    echo "$master_key"
+}
+
+# Encrypt a file with the master key → produces .enc file
+_encrypt_file() {
+    local src="$1" dst="$2"
+    local master_key
+    master_key=$(_vault_unlock)
+
+    openssl enc -${CIPHER} -pbkdf2 -iter ${KDF_ITER} \
+        -pass "fd:3" -in "$src" -out "$dst" 3< <(echo -n "$master_key") 2>/dev/null \
+        || die "Failed to encrypt $src"
+    chmod 600 "$dst"
+}
+
+_decrypt_file() {
+    local src="$1" dst="$2"
+    local master_key
+    master_key=$(_vault_unlock)
+
+    openssl enc -${CIPHER} -d -pbkdf2 -iter ${KDF_ITER} \
+        -pass "fd:3" -in "$src" -out "$dst" 3< <(echo -n "$master_key") 2>/dev/null \
+        || die "Failed to decrypt $src"
+}
+
+_decrypt_to_stdout() {
+    local src="$1"
+    local master_key
+    master_key=$(_vault_unlock)
+
+    openssl enc -${CIPHER} -d -pbkdf2 -iter ${KDF_ITER} \
+        -pass "fd:3" -in "$src" 3< <(echo -n "$master_key") 2>/dev/null \
+        || die "Failed to decrypt $src"
+}
+
+
+# Secure-delete a file (overwrite then remove)
+_secure_delete() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    local sz
+    sz=$(stat -c%s "$f" 2>/dev/null) || sz=4096
+    dd if=/dev/urandom of="$f" bs=1 count="$sz" conv=notrunc 2>/dev/null || true
+    dd if=/dev/zero of="$f" bs=1 count="$sz" conv=notrunc 2>/dev/null || true
+    rm -f "$f"
+}
+
+# Create a tmpfs-backed directory for ephemeral secrets
+_create_secrets_tmpfs() {
+    local mountpoint="$1"
+    mkdir -p "$mountpoint"
+    if ! mountpoint -q "$mountpoint" 2>/dev/null; then
+        mount -t tmpfs -o size=4m,mode=0700,noexec,nosuid tmpfs "$mountpoint"
+    fi
+}
+
+# Clean up secrets tmpfs
+_destroy_secrets_tmpfs() {
+    local mountpoint="$1"
+    if mountpoint -q "$mountpoint" 2>/dev/null; then
+        umount "$mountpoint" 2>/dev/null || umount -l "$mountpoint" 2>/dev/null || true
+    fi
+    rmdir "$mountpoint" 2>/dev/null || true
+}
+
+# Check if AMD SEV is available
+_sev_available() {
+    [[ -c /dev/sev ]] || return 1
+    [[ "$(<"/sys/module/kvm_amd/parameters/sev" 2>/dev/null)" == "Y" ]]
+}
+
+require_root() {
+    [[ $EUID -eq 0 ]] || die "This command must be run as root (try: sudo $PROG $*)"
+}
+
+check_deps() {
+    local missing=()
+    for cmd in qemu-system-x86_64 qemu-img wg nft ip curl jq ssh-keygen socat; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing commands: ${missing[*]}. Run '$PROG setup' first."
+    fi
+}
+
+_install_packages() {
+    local needed=()
+    for cmd in qemu-system-x86_64 qemu-img wg nft socat; do
+        command -v "$cmd" &>/dev/null || needed+=("$cmd")
+    done
+    [[ ${#needed[@]} -eq 0 ]] && { info "All system packages already installed"; return 0; }
+
+    if command -v pacman &>/dev/null; then
+        # Arch / CachyOS / Manjaro
+        local pkgs=()
+        for cmd in "${needed[@]}"; do
+            case "$cmd" in
+                qemu-system-x86_64) pkgs+=(qemu-system-x86) ;;
+                qemu-img)           pkgs+=(qemu-img) ;;
+                wg)                 pkgs+=(wireguard-tools) ;;
+                nft)                pkgs+=(nftables) ;;
+                socat)              pkgs+=(socat) ;;
+            esac
+        done
+        info "Installing (pacman): ${pkgs[*]}"
+        pacman -S --noconfirm --needed "${pkgs[@]}" || die "pacman install failed"
+    elif command -v apt-get &>/dev/null; then
+        # Debian / Ubuntu
+        local pkgs=()
+        for cmd in "${needed[@]}"; do
+            case "$cmd" in
+                qemu-system-x86_64) pkgs+=(qemu-system-x86) ;;
+                qemu-img)           pkgs+=(qemu-utils) ;;
+                wg)                 pkgs+=(wireguard-tools) ;;
+                nft)                pkgs+=(nftables) ;;
+                socat)              pkgs+=(socat) ;;
+            esac
+        done
+        info "Installing (apt): ${pkgs[*]}"
+        apt-get update -qq && apt-get install -y "${pkgs[@]}" || die "apt install failed"
+    elif command -v dnf &>/dev/null; then
+        # Fedora / RHEL
+        local pkgs=()
+        for cmd in "${needed[@]}"; do
+            case "$cmd" in
+                qemu-system-x86_64) pkgs+=(qemu-kvm) ;;
+                qemu-img)           pkgs+=(qemu-img) ;;
+                wg)                 pkgs+=(wireguard-tools) ;;
+                nft)                pkgs+=(nftables) ;;
+                socat)              pkgs+=(socat) ;;
+            esac
+        done
+        info "Installing (dnf): ${pkgs[*]}"
+        dnf install -y "${pkgs[@]}" || die "dnf install failed"
+    else
+        die "Unsupported package manager. Install manually: ${needed[*]}"
+    fi
+}
+
+cleanup_on_exit() {
+    local name="$1"
+    warn "Caught signal, cleaning up VM '${name}'..."
+    _do_stop "$name" 2>/dev/null || true
+    exit 1
+}
+
+# Allocate a unique VM index (1-254) for subnet assignment
+_alloc_vm_index() {
+    local used=()
+    for meta in "$VMS_DIR"/*/vm.meta; do
+        [[ -f "$meta" ]] && used+=($(jq -r '.vm_index // empty' "$meta" 2>/dev/null))
+    done
+    for i in $(seq 1 254); do
+        [[ " ${used[*]} " != *" $i "* ]] && echo "$i" && return 0
+    done
+    die "No free VM index (max 254 concurrent VMs)"
+}
+
+# --- Mullvad server management ---
+
+_mullvad_conf_check() {
+    # Check for encrypted config first, then plaintext
+    if [[ -f "${MULLVAD_CONF}.enc" ]]; then
+        return 0  # encrypted config exists
+    elif [[ -f "$MULLVAD_CONF" ]]; then
+        # Plaintext exists — validate it, will be encrypted during setup
+        grep -q '^private_key=' "$MULLVAD_CONF" || die "mullvad.conf missing 'private_key='"
+        grep -q '^address=' "$MULLVAD_CONF" || die "mullvad.conf missing 'address='"
+        return 0
+    else
+        die "Mullvad config not found. Create $MULLVAD_CONF with:
+  private_key=<your-wireguard-private-key>
+  address=<your-mullvad-wg-address e.g. 10.68.x.x/32>
+Then run '$PROG setup' to encrypt it."
+    fi
+}
+
+# Decrypt mullvad config to a tmpfs-backed temp file, return the path
+# Caller must clean up the returned file
+_mullvad_decrypt() {
+    local tmpfile
+    tmpfile=$(mktemp /dev/shm/.paranoid-mullvad-XXXXXX)
+    chmod 600 "$tmpfile"
+
+    if [[ -f "${MULLVAD_CONF}.enc" ]]; then
+        _decrypt_file "${MULLVAD_CONF}.enc" "$tmpfile"
+    elif [[ -f "$MULLVAD_CONF" ]]; then
+        cp "$MULLVAD_CONF" "$tmpfile"
+    else
+        rm -f "$tmpfile"
+        die "No mullvad config found"
+    fi
+    echo "$tmpfile"
+}
+
+_mullvad_read() {
+    local conf; conf=$(_mullvad_decrypt)
+    _MULLVAD_KEY=$(grep '^private_key=' "$conf" | cut -d= -f2-)
+    _MULLVAD_ADDR=$(grep '^address=' "$conf" | cut -d= -f2-)
+    _secure_delete "$conf"
+}
+
+readonly MULLVAD_API="https://api.mullvad.net"
+
+_mullvad_get_token() {
+    local account="$1"
+    local resp body
+    body=$(jq -n --arg a "$account" '{"account_number":$a}')
+    resp=$(curl -sS --max-time 10 -X POST \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "${MULLVAD_API}/auth/v1/token" 2>/dev/null)
+    local token
+    token=$(echo "$resp" | jq -r '.access_token // empty' 2>/dev/null)
+    if [[ -z "$token" ]]; then
+        local err
+        err=$(echo "$resp" | jq -r '.error // .detail // "unknown error"' 2>/dev/null)
+        die "Mullvad auth failed: $err"
+    fi
+    echo "$token"
+}
+
+_mullvad_list_devices() {
+    local token="$1"
+    curl -sS --max-time 10 \
+        -H "Authorization: Bearer ${token}" \
+        "${MULLVAD_API}/accounts/v1/devices" 2>/dev/null
+}
+
+_mullvad_delete_device() {
+    local token="$1" device_id="$2"
+    local http_code
+    http_code=$(curl -sS --max-time 10 -X DELETE -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${token}" \
+        "${MULLVAD_API}/accounts/v1/devices/${device_id}" 2>/dev/null)
+    [[ "$http_code" == "204" || "$http_code" == "200" ]] \
+        || die "Failed to delete Mullvad device ${device_id} (HTTP ${http_code})"
+}
+
+_mullvad_register_key() {
+    local account="$1"
+
+    info "Authenticating with Mullvad..." >&2
+    local token
+    token=$(_mullvad_get_token "$account")
+
+    local privkey pubkey
+    privkey=$(wg genkey)
+    pubkey=$(echo "$privkey" | wg pubkey)
+
+    info "Registering WireGuard key..." >&2
+    local resp
+    resp=$(curl -sS --max-time 15 -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg k "$pubkey" '{"pubkey":$k}')" \
+        "${MULLVAD_API}/accounts/v1/devices" 2>/dev/null)
+
+    # Check for success (has ipv4_address)
+    local addr
+    addr=$(echo "$resp" | jq -r '.ipv4_address // empty' 2>/dev/null)
+    if [[ -n "$addr" ]]; then
+        local dev_name
+        dev_name=$(echo "$resp" | jq -r '.name // "unknown"' 2>/dev/null)
+        info "Registered as '${dev_name}' (${addr})" >&2
+        echo "private_key=${privkey}"
+        echo "address=${addr}"
+        return 0
+    fi
+
+    if echo "$resp" | jq -r '.code // empty' 2>/dev/null | grep -q "MAX_DEVICES_REACHED"; then
+        info "Device limit reached, removing oldest..." >&2
+        local devices oldest_id oldest_name
+        devices=$(_mullvad_list_devices "$token")
+        echo "$devices" | jq -e 'type == "array"' &>/dev/null \
+            || die "Failed to list devices: $(echo "$devices" | jq -r '.detail // .error // empty' 2>/dev/null)"
+        oldest_id=$(echo "$devices" | jq -r 'sort_by(.created) | .[0].id // empty')
+        oldest_name=$(echo "$devices" | jq -r 'sort_by(.created) | .[0].name // "unknown"')
+        [[ -n "$oldest_id" ]] || die "No devices found to remove"
+
+        info "Removing: ${oldest_name}" >&2
+        _mullvad_delete_device "$token" "$oldest_id"
+        sleep 1
+
+        resp=$(curl -sS --max-time 15 -X POST \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg k "$pubkey" '{"pubkey":$k}')" \
+            "${MULLVAD_API}/accounts/v1/devices" 2>/dev/null)
+
+        addr=$(echo "$resp" | jq -r '.ipv4_address // empty' 2>/dev/null)
+        if [[ -n "$addr" ]]; then
+            local dev_name
+            dev_name=$(echo "$resp" | jq -r '.name // "unknown"' 2>/dev/null)
+            info "Registered as '${dev_name}' (${addr})" >&2
+            echo "private_key=${privkey}"
+            echo "address=${addr}"
+            return 0
+        fi
+    fi
+
+    die "Mullvad registration failed: $(echo "$resp" | jq -r '.detail // .error // empty' 2>/dev/null || echo "$resp")"
+}
+
+_refresh_servers() {
+    if [[ -f "$SERVERS_CACHE" ]]; then
+        local age=$(( $(date +%s) - $(stat -c %Y "$SERVERS_CACHE") ))
+        [[ $age -le $SERVERS_MAX_AGE ]] && return 0
+    fi
+    info "Fetching Mullvad server list..."
+    local tmpfile; tmpfile=$(mktemp)
+    curl -sS --max-time 30 "https://api.mullvad.net/www/relays/wireguard/" -o "$tmpfile" \
+        || { rm -f "$tmpfile"; die "Failed to fetch Mullvad server list"; }
+    jq -e '.[0].hostname' "$tmpfile" &>/dev/null \
+        || { rm -f "$tmpfile"; die "Invalid server list from Mullvad API"; }
+    mv "$tmpfile" "$SERVERS_CACHE"
+    info "Cached $(jq 'length' "$SERVERS_CACHE") servers"
+}
+
+# Pick a random server, optionally filtered by country code
+# Args: [country_code] [exclude_hostname]
+_pick_server() {
+    local country="${1:-}"
+    local exclude="${2:-}"
+
+    _refresh_servers
+
+    # Build jq filter with safe parameterized args (no string interpolation)
+    local jq_args=()
+    local jq_filter='[.[] | select(.active == true)]'
+    if [[ -n "$country" ]]; then
+        jq_args+=(--arg cc "$country")
+        jq_filter="${jq_filter} | [.[] | select(.country_code == \$cc)]"
+    fi
+    if [[ -n "$exclude" ]]; then
+        jq_args+=(--arg ex "$exclude")
+        jq_filter="${jq_filter} | [.[] | select(.hostname != \$ex)]"
+    fi
+
+    # Get count first
+    local count
+    count=$(jq "${jq_args[@]}" "${jq_filter} | length" "$SERVERS_CACHE")
+
+    if [[ "$count" -eq 0 ]]; then
+        die "No servers found${country:+ for country '$country'}${exclude:+ excluding '$exclude'}"
+    fi
+
+    # Pick random index
+    local idx=$(( RANDOM % count ))
+    jq -c "${jq_args[@]}" "${jq_filter} | .[${idx}]" "$SERVERS_CACHE"
+}
+
+# --- Network namespace + WireGuard + kill switch ---
+
+_create_namespace() {
+    local ns="$1"
+    ip netns add "$ns"
+    # Bring up loopback
+    ip netns exec "$ns" ip link set lo up
+    # Disable IPv6 entirely in the namespace
+    ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+    ip netns exec "$ns" sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+    debug "Created namespace $ns"
+}
+
+_setup_wireguard() {
+    # WG stays in ROOT namespace — has normal internet access, no routing loop
+    local wg_iface="$1"
+    local private_key="$2"
+    local address="$3"
+    local server_json="$4"
+
+    local endpoint pubkey server_ip
+    server_ip=$(echo "$server_json" | jq -r '.ipv4_addr_in')
+    endpoint="${server_ip}:51820"
+    pubkey=$(echo "$server_json" | jq -r '.pubkey')
+
+    # Validate server data (prevent injection via tampered servers.json)
+    [[ "$server_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid server IP: $server_ip"
+    [[ "$pubkey" =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "Invalid server pubkey format"
+
+    ip link add "$wg_iface" type wireguard
+
+    # Use /dev/shm (tmpfs) for key material — never touches persistent storage
+    local wg_key_file
+    wg_key_file=$(mktemp /dev/shm/.paranoid-wgkey-XXXXXX)
+    echo "$private_key" > "$wg_key_file"
+    chmod 600 "$wg_key_file"
+
+    # Use 'wg set' with all params at once (wg setconf wipes private key!)
+    wg set "$wg_iface" \
+        private-key "$wg_key_file" \
+        peer "$pubkey" \
+        endpoint "$endpoint" \
+        allowed-ips "0.0.0.0/0" \
+        persistent-keepalive 25
+    _secure_delete "$wg_key_file"
+
+    ip addr add "$address" dev "$wg_iface"
+    ip link set "$wg_iface" up
+    # No default route in root — policy routing sends veth traffic through WG
+
+    debug "WireGuard $wg_iface up in root -> $endpoint"
+}
+
+_setup_veth() {
+    # Connect namespace to root via veth pair + policy routing through WG
+    local ns="$1"
+    local vm_index="$2"
+    local wg_iface="$3"
+
+    local veth_ns="ve${vm_index}ns"
+    local veth_host="ve${vm_index}host"
+    local veth_ns_ip="${VETH_SUBNET}.${vm_index}.1"
+    local veth_host_ip="${VETH_SUBNET}.${vm_index}.2"
+    local rt_table=$((100 + vm_index))
+
+    ip link add "$veth_host" type veth peer name "$veth_ns"
+    ip link set "$veth_ns" netns "$ns"
+
+    ip addr add "${veth_host_ip}/30" dev "$veth_host"
+    ip link set "$veth_host" up
+
+    ip netns exec "$ns" ip addr add "${veth_ns_ip}/30" dev "$veth_ns"
+    ip netns exec "$ns" ip link set "$veth_ns" up
+
+    ip netns exec "$ns" ip route add default via "$veth_host_ip" dev "$veth_ns"
+
+    # Policy routing in root: traffic arriving from veth → WG tunnel
+    ip route add default dev "$wg_iface" table "$rt_table" 2>/dev/null || true
+    ip rule add iif "$veth_host" table "$rt_table" priority $((1000 + vm_index))
+
+    sysctl -qw net.ipv4.ip_forward=1
+
+    debug "Veth $veth_ns (ns) <-> $veth_host (root), rt_table=$rt_table -> $wg_iface"
+    echo "${veth_ns} ${veth_host} ${veth_ns_ip} ${veth_host_ip} ${rt_table}"
+}
+
+_setup_root_firewall() {
+    # Root-side: only allow veth<->WG forwarding + masquerade
+    # Uses iptables (not nftables) to work with UFW's FORWARD chain
+    local name="$1"
+    local wg_iface="$2"
+    local veth_host="$3"
+    local veth_subnet="$4"  # e.g. 10.99.X.0/30
+
+    # Insert in reverse order (last inserted = first evaluated)
+    iptables -I FORWARD -o "${veth_host}" -j DROP -m comment --comment "paranoid-${name}"
+    iptables -I FORWARD -i "${veth_host}" -j DROP -m comment --comment "paranoid-${name}"
+    iptables -I FORWARD -o "${veth_host}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT -m comment --comment "paranoid-${name}"
+    iptables -I FORWARD -i "${veth_host}" -o "${wg_iface}" -j ACCEPT -m comment --comment "paranoid-${name}"
+
+    # Masquerade veth traffic going out via WG
+    iptables -t nat -A POSTROUTING -s "${veth_subnet}" -o "${wg_iface}" -j MASQUERADE -m comment --comment "paranoid-${name}"
+
+    # Block ALL IPv6 from/to veth
+    ip6tables -I FORWARD -i "${veth_host}" -j DROP -m comment --comment "paranoid-${name}" 2>/dev/null || true
+    ip6tables -I FORWARD -o "${veth_host}" -j DROP -m comment --comment "paranoid-${name}" 2>/dev/null || true
+
+    debug "Root firewall: ${veth_host} <-> ${wg_iface} only"
+}
+
+_setup_ns_firewall() {
+    # Namespace-side: structural kill switch — only veth + TAP + loopback
+    # No WG interface in namespace. Only exit is veth → root → WG.
+    local ns="$1"
+    local veth_ns="$2"
+    local tap_subnet="$3"
+
+    ip netns exec "$ns" nft -f - << EOF
+table inet killswitch {
+    chain output {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        oifname "${veth_ns}" ip version 4 accept
+        ip daddr ${tap_subnet} accept
+        # Block ALL IPv6 explicitly
+        ip6 version 6 drop
+        log prefix "KILLSWITCH DROP: " drop
+    }
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        ip saddr ${tap_subnet} accept
+        iifname "${veth_ns}" ct state established,related accept
+        # Block ALL IPv6
+        ip6 version 6 drop
+        drop
+    }
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        iifname "tap-*" oifname "${veth_ns}" ip version 4 accept
+        ct state established,related accept
+        # Block ALL IPv6
+        ip6 version 6 drop
+        drop
+    }
+}
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "${veth_ns}" masquerade
+    }
+}
+EOF
+    ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
+
+    debug "Namespace firewall applied in $ns"
+}
+
+_setup_tap() {
+    local ns="$1"
+    local tap_name="$2"
+    local tap_addr="$3"    # e.g. 10.155.X.1/24
+
+    ip netns exec "$ns" ip tuntap add dev "$tap_name" mode tap
+    ip netns exec "$ns" ip addr add "$tap_addr" dev "$tap_name"
+    ip netns exec "$ns" ip link set "$tap_name" up
+
+    # ARP hardening: prevent VM from spoofing gateway addresses
+    ip netns exec "$ns" sysctl -qw "net.ipv4.conf.${tap_name}.arp_filter=1" 2>/dev/null || true
+    ip netns exec "$ns" sysctl -qw "net.ipv4.conf.${tap_name}.arp_ignore=2" 2>/dev/null || true
+
+    debug "TAP $tap_name up at $tap_addr in $ns"
+}
+
+# --- Control plane (HTTP API on TAP gateway for VM-side WG management) ---
+
+_start_controlplane() {
+    local ns="$1"
+    local tap_addr="$2"
+    local meta_path="$3"
+    local wg_iface="$4"
+    local vm_dir="$5"
+    local auto_rotate="${6:-0}"
+
+    [[ -f "$CONTROLPLANE_BIN" ]] || {
+        warn "Control plane binary not found at $CONTROLPLANE_BIN — skipping"
+        return 0
+    }
+
+    info "Starting control plane API on ${tap_addr}:${CONTROL_PORT}..."
+
+    local extra_args=()
+    if [[ "$auto_rotate" -gt 0 ]]; then
+        extra_args+=(--auto-rotate "$auto_rotate")
+    fi
+
+    ip netns exec "$ns" python3 "$CONTROLPLANE_BIN" \
+        --bind "$tap_addr" \
+        --port "$CONTROL_PORT" \
+        --meta "$meta_path" \
+        --servers "$SERVERS_CACHE" \
+        --wg-iface "$wg_iface" \
+        --wg-netns root \
+        "${extra_args[@]+"${extra_args[@]}"}" \
+        </dev/null \
+        >>"${vm_dir}/controlplane.log" \
+        2>&1 &
+
+    local cp_pid=$!
+    echo "$cp_pid" > "${vm_dir}/controlplane.pid"
+    sleep 0.3
+
+    if kill -0 "$cp_pid" 2>/dev/null; then
+        debug "Control plane started (PID: $cp_pid)"
+    else
+        warn "Control plane failed to start — check ${vm_dir}/controlplane.log"
+    fi
+}
+
+_stop_controlplane() {
+    local vm_dir="$1"
+    local pidfile="${vm_dir}/controlplane.pid"
+
+    if [[ -f "$pidfile" ]]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            # Brief wait
+            local i=0
+            while kill -0 "$pid" 2>/dev/null && [[ $i -lt 6 ]]; do
+                sleep 0.2; i=$((i + 1))
+            done
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile"
+    fi
+}
+
+# --- Cgroup resource limits ---
+
+_setup_cgroup() {
+    local name="$1"
+    local qemu_pid="$2"
+    local max_cpu="$3"   # percentage (0=unlimited, 100=1 core, 200=2 cores)
+    local max_mem="$4"   # megabytes (0=unlimited)
+
+    local cg_path="/sys/fs/cgroup/paranoid-${name}"
+
+    # cgroup v2 check
+    if [[ ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
+        warn "cgroup v2 not available — resource limits not applied"
+        return 0
+    fi
+
+    mkdir -p "$cg_path"
+
+    # CPU limit: max_cpu as percentage of one core (100 = 1 core)
+    # cgroup v2 uses cpu.max: "$QUOTA $PERIOD" in microseconds
+    if [[ "$max_cpu" -gt 0 ]]; then
+        local period=100000  # 100ms
+        local quota=$(( max_cpu * period / 100 ))
+        echo "${quota} ${period}" > "$cg_path/cpu.max"
+        debug "CPU limit: ${max_cpu}% (${quota}/${period}us)"
+    fi
+
+    # Memory limit
+    if [[ "$max_mem" -gt 0 ]]; then
+        echo "$(( max_mem * 1024 * 1024 ))" > "$cg_path/memory.max"
+        debug "Memory limit: ${max_mem}MB"
+    fi
+
+    echo "$qemu_pid" > "$cg_path/cgroup.procs"
+    debug "QEMU PID $qemu_pid added to cgroup paranoid-${name}"
+}
+
+_teardown_cgroup() {
+    local name="$1"
+    local cg_path="/sys/fs/cgroup/paranoid-${name}"
+    if [[ -d "$cg_path" ]]; then
+        # Move remaining processes back to root cgroup
+        while read -r pid; do
+            echo "$pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+        done < "$cg_path/cgroup.procs" 2>/dev/null
+        rmdir "$cg_path" 2>/dev/null || true
+    fi
+}
+
+# --- SSH readiness wait ---
+
+_wait_for_ssh() {
+    local ns="$1"
+    local vm_ip="$2"
+    local key_path="$3"
+    local timeout="${4:-30}"
+
+    info "Waiting for VM SSH to become ready..."
+    local start=$SECONDS
+    while (( SECONDS - start < timeout )); do
+        if ip netns exec "$ns" ssh -i "$key_path" "${SSH_OPTS[@]}" \
+            -o ConnectTimeout=2 "agent@${vm_ip}" true 2>/dev/null; then
+            info "VM SSH ready ($(( SECONDS - start ))s)"
+            return 0
+        fi
+        sleep 1
+    done
+    warn "VM SSH not ready after ${timeout}s — VM may still be booting"
+    return 1
+}
+
+# --- Local inference pinhole (veth pair with single-port nftables) ---
+
+_parse_inference_arg() {
+    # Parse host:port, validate format
+    local arg="$1"
+    local host port
+    # Handle IPv4:port
+    if [[ "$arg" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    else
+        die "Invalid --local-inference format: '$arg' (expected IP:PORT, e.g. 192.168.1.100:11434)"
+    fi
+    [[ "$port" -gt 0 && "$port" -le 65535 ]] || die "Invalid port: $port"
+    echo "${host} ${port}"
+}
+
+_setup_inference_pinhole() {
+    # Inference uses the EXISTING veth (no second veth needed).
+    # Root: route inference host directly to LAN (bypass WG in policy table)
+    # Root: allow veth→LAN for inference endpoint, DNAT, masquerade
+    # Namespace: DNAT from TAP gateway to inference host via veth
+    local ns="$1"
+    local name="$2"
+    local veth_host="$3"
+    local inference_host="$4"
+    local inference_port="$5"
+    local tap_addr="$6"
+    local veth_subnet="$7"  # e.g. 10.99.X.0/30
+    local rt_table="$8"
+    local vm_ip="$9"
+
+    info "Setting up inference pinhole: ${tap_addr}:${INFERENCE_PORT} -> ${inference_host}:${inference_port}"
+
+    # Add specific route for inference host via LAN in the VM's policy table
+    # This overrides the default-through-WG route for this one host
+    local lan_gw lan_if
+    lan_gw=$(ip route show default | awk '{print $3; exit}')
+    lan_if=$(ip route show default | awk '{print $5; exit}')
+    ip route add "${inference_host}/32" via "$lan_gw" dev "$lan_if" table "$rt_table"
+
+    # Root: allow + DNAT inference traffic (direct to LAN, bypasses WG)
+    iptables -I FORWARD -i "${veth_host}" -d "${inference_host}" -p tcp --dport "${inference_port}" -j ACCEPT -m comment --comment "paranoid-${name}-inf"
+    iptables -I FORWARD -o "${veth_host}" -s "${inference_host}" -p tcp --sport "${inference_port}" -m conntrack --ctstate ESTABLISHED -j ACCEPT -m comment --comment "paranoid-${name}-inf"
+    iptables -t nat -I PREROUTING -i "${veth_host}" -d "${tap_addr}" -p tcp --dport "${INFERENCE_PORT}" -j DNAT --to-destination "${inference_host}:${inference_port}" -m comment --comment "paranoid-${name}-inf"
+    iptables -t nat -A POSTROUTING -s "${veth_subnet}" -d "${inference_host}" -j MASQUERADE -m comment --comment "paranoid-${name}-inf"
+
+    # Namespace: DNAT from TAP so VM hits tap_addr:INFERENCE_PORT -> inference_host:port
+    ip netns exec "$ns" nft -f - << EOF
+add table ip inference_nat
+add chain ip inference_nat prerouting { type nat hook prerouting priority -100; policy accept; }
+add rule ip inference_nat prerouting iifname "tap-*" ip saddr ${vm_ip} ip daddr ${tap_addr} tcp dport ${INFERENCE_PORT} dnat to ${inference_host}:${inference_port}
+EOF
+}
+
+_teardown_host_rules() {
+    local name="$1"
+    { iptables-save -t filter 2>/dev/null || true; } | grep "paranoid-${name}" | sed 's/^-A /-D /' | \
+        while IFS= read -r rule; do iptables $rule 2>/dev/null; done || true
+    { iptables-save -t nat 2>/dev/null || true; } | grep "paranoid-${name}" | sed 's/^-A /-D /' | \
+        while IFS= read -r rule; do iptables -t nat $rule 2>/dev/null; done || true
+    { ip6tables-save -t filter 2>/dev/null || true; } | grep "paranoid-${name}" | sed 's/^-A /-D /' | \
+        while IFS= read -r rule; do ip6tables $rule 2>/dev/null; done || true
+}
+
+# --- VM image management ---
+
+_build_base_image() {
+    info "Building Alpine base rootfs image..."
+
+    local workdir
+    workdir=$(mktemp -d)
+    local rootfs="${workdir}/rootfs"
+    mkdir -p "$rootfs"
+
+    # Fetch latest Alpine minirootfs version from manifest
+    info "Fetching latest Alpine release info..."
+    local manifest alpine_ver alpine_file alpine_sha256
+    manifest=$(curl -sS --max-time 15 \
+        "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/${ALPINE_ARCH}/latest-releases.yaml") \
+        || die "Failed to fetch Alpine release manifest"
+
+    # Parse YAML with grep (avoid python/yq dependency)
+    local minirootfs_block
+    minirootfs_block=$(echo "$manifest" | grep -A10 'flavor: alpine-minirootfs')
+    alpine_file=$(echo "$minirootfs_block" | grep 'file:' | awk '{print $2}' | head -1)
+    alpine_sha256=$(echo "$minirootfs_block" | grep 'sha256:' | awk '{print $2}' | head -1)
+    alpine_ver=$(echo "$manifest" | grep -B2 'flavor: alpine-minirootfs' | grep 'version:' | awk '{print $2}' | head -1)
+
+    [[ -n "$alpine_file" && -n "$alpine_sha256" ]] || die "Could not parse Alpine release manifest"
+
+    local alpine_url="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/${ALPINE_ARCH}/${alpine_file}"
+    local tarball="${workdir}/alpine-minirootfs.tar.gz"
+
+    info "Downloading Alpine ${alpine_ver} minirootfs..."
+    curl -sS -L --max-time 120 -o "$tarball" "$alpine_url" || die "Failed to download Alpine minirootfs"
+
+    # Verify integrity
+    local actual_sha
+    actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
+    if [[ "$actual_sha" != "$alpine_sha256" ]]; then
+        die "Alpine minirootfs SHA256 mismatch (expected ${alpine_sha256:0:16}..., got ${actual_sha:0:16}...)"
+    fi
+
+    tar xzf "$tarball" -C "$rootfs"
+
+    # Set up resolv.conf for package installation
+    echo "nameserver 1.1.1.1" > "$rootfs/etc/resolv.conf"
+
+    # Create init script (PID 1) for microvm
+    cat > "$rootfs/sbin/micro-init" << 'INITEOF'
+#!/bin/sh
+# Minimal init for microvm
+
+# Mount essential filesystems
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+mount -t tmpfs tmpfs /run 2>/dev/null
+
+# Set hostname
+hostname paranoid
+
+# Bring up loopback
+ip link set lo up
+
+# Configure eth0 via static (address passed via kernel cmdline)
+vm_ip="" vm_gw="" vm_dns=""
+for param in $(cat /proc/cmdline); do
+    case "$param" in
+        vm_ip=*)  vm_ip="${param#vm_ip=}" ;;
+        vm_gw=*)  vm_gw="${param#vm_gw=}" ;;
+        vm_dns=*) vm_dns="${param#vm_dns=}" ;;
+    esac
+done
+if [ -n "$vm_ip" ] && [ -n "$vm_gw" ]; then
+    # Wait briefly for virtio-net device to appear
+    for i in 1 2 3 4 5; do
+        ip link show eth0 >/dev/null 2>&1 && break
+        sleep 0.2
+    done
+    ip addr add "$vm_ip" dev eth0 2>/dev/null && \
+    ip link set eth0 up 2>/dev/null && \
+    ip route add default via "$vm_gw" 2>/dev/null || \
+    echo "micro-init: eth0 configuration failed (no NIC?)"
+fi
+
+# DNS
+if [ -n "$vm_dns" ]; then
+    echo "nameserver $vm_dns" > /etc/resolv.conf
+fi
+
+# Disable IPv6
+sysctl -qw net.ipv6.conf.all.disable_ipv6=1 2>/dev/null
+sysctl -qw net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
+
+# Start syslogd minimally
+syslogd -O /var/log/messages 2>/dev/null || true
+
+# Generate SSH host keys if missing
+if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+    ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" 2>/dev/null
+fi
+
+# Start SSH daemon
+mkdir -p /run/sshd
+/usr/sbin/sshd -e 2>/dev/null || true
+
+# ── Hardening ──────────────────────────────────────────────
+# Philosophy: protect only the sandbox infrastructure itself.
+# The agent should be a fully capable dev environment —
+# it can install packages, run services, use network tools.
+# What it must NOT be able to do is break the things that
+# keep the sandbox working: the VPN tool, SSH access back in,
+# DNS/network config that the host relies on, and the init script.
+
+# Immutable: sandbox infrastructure files only
+for f in /usr/local/bin/vpn \
+         /etc/hosts /etc/resolv.conf \
+         /etc/ssh/sshd_config /etc/ssh/ssh_host_*_key* \
+         /etc/doas.conf \
+         /home/agent/.ssh/authorized_keys \
+         /home/agent/rescue-agent \
+         /sbin/micro-init; do
+    [ -e "$f" ] && chattr +i "$f" 2>/dev/null
+done
+[ -d /home/agent/.ssh ] && chattr +i /home/agent/.ssh 2>/dev/null
+
+# Kernel hardening (doesn't restrict userspace, just reduces kernel attack surface)
+echo 0 > /proc/sys/kernel/sysrq 2>/dev/null
+echo 1 > /proc/sys/kernel/dmesg_restrict 2>/dev/null
+
+# ── End hardening ──────────────────────────────────────────
+
+# Start a getty on the serial console
+exec /sbin/getty -L 115200 ttyS0 vt100
+INITEOF
+    chmod +x "$rootfs/sbin/micro-init"
+
+    # Set up the rootfs with chroot + QEMU static if needed (but since same arch, direct chroot works)
+    # Install packages via chroot
+    # First, copy resolv.conf and set up APK
+    local alpine_branch="${alpine_ver%.*}"  # 3.23.3 -> 3.23
+    mkdir -p "$rootfs/etc/apk"
+    cat > "$rootfs/etc/apk/repositories" << EOF
+https://dl-cdn.alpinelinux.org/alpine/v${alpine_branch}/main
+https://dl-cdn.alpinelinux.org/alpine/v${alpine_branch}/community
+EOF
+
+    # Install packages via chroot
+    info "Installing packages in rootfs (openssh, python3, etc.)..."
+    # We need to bind-mount /dev, /proc, /sys for chroot to work
+    mount --bind /dev "$rootfs/dev"
+    mount --bind /proc "$rootfs/proc"
+    mount --bind /sys "$rootfs/sys"
+    # Use a DNS that works
+    echo "nameserver 1.1.1.1" > "$rootfs/etc/resolv.conf"
+
+    chroot "$rootfs" /bin/sh -c "
+        export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+        apk update && \
+        apk add --no-cache \
+            openssh-server \
+            python3 \
+            iproute2 \
+            iputils \
+            curl \
+            ca-certificates \
+            shadow \
+            doas
+    " || { umount "$rootfs/sys" "$rootfs/proc" "$rootfs/dev"; die "Failed to install packages"; }
+
+    umount "$rootfs/sys" "$rootfs/proc" "$rootfs/dev"
+
+    # Create agent user
+    chroot "$rootfs" /bin/sh -c "
+        export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+        adduser -D -s /bin/sh agent && \
+        echo 'agent:agent' | chpasswd && \
+        mkdir -p /home/agent/.ssh && \
+        chmod 700 /home/agent/.ssh && \
+        chown -R agent:agent /home/agent
+    "
+
+    # Configure doas — agent gets passwordless root (VM is the sandbox boundary)
+    cat > "$rootfs/etc/doas.conf" << 'DOASEOF'
+permit nopass agent
+DOASEOF
+    chmod 400 "$rootfs/etc/doas.conf"
+
+    # Configure SSH
+    cat > "$rootfs/etc/ssh/sshd_config" << 'SSHEOF'
+Port 22
+ListenAddress 0.0.0.0
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+Subsystem sftp /usr/lib/ssh/sftp-server
+SSHEOF
+
+    # Configure auto-login serial console and inittab
+    cat > "$rootfs/etc/inittab" << 'TTEOF'
+::sysinit:/sbin/micro-init
+ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/kill -TERM -1
+::shutdown:/bin/umount -a -r
+TTEOF
+
+    # Set up fstab (minimal)
+    cat > "$rootfs/etc/fstab" << 'FSTAB'
+/dev/vda / ext4 rw,relatime 0 1
+FSTAB
+
+    # Set root password (for serial console access)
+    # Lock root password (SSH key-only access, no serial console login)
+    chroot "$rootfs" /bin/sh -c "export PATH=/usr/sbin:/usr/bin:/sbin:/bin; passwd -l root"
+
+    # Ensure /var/log exists
+    mkdir -p "$rootfs/var/log"
+
+    # Install `vpn` convenience script for VM-side WG control
+    mkdir -p "$rootfs/usr/local/bin"
+    cat > "$rootfs/usr/local/bin/vpn" << 'VPNEOF'
+#!/bin/sh
+# vpn — control WireGuard from inside the VM
+# Talks to the host control plane API on the TAP gateway
+GW=$(ip route 2>/dev/null | awk '/default/{print $3}')
+[ -z "$GW" ] && GW="10.155.1.1"
+API="http://${GW}:9111"
+
+case "${1:-help}" in
+  status|s)
+    curl -sf "$API/status" | python3 -m json.tool 2>/dev/null || \
+      curl -sf "$API/status" || echo "Error: control plane not reachable at $API"
+    ;;
+  locations|loc|l)
+    if [ -n "$2" ]; then
+      # Filter by country
+      curl -sf "$API/locations" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for c in d['countries']:
+    if '$2'.lower() in (c['code'], c['name'].lower()):
+        print(f\"{c['code']:>4s}  {c['name']:<28s} {c['server_count']:>3d} servers  ({', '.join(c['cities'])})\")
+" 2>/dev/null
+    else
+      curl -sf "$API/locations" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(f\"{'CODE':>4s}  {'COUNTRY':<28s} {'#':>3s}  CITIES\")
+print('-'*80)
+for c in d['countries']:
+    cities=', '.join(c['cities'][:4])
+    if len(c['cities'])>4: cities+=' ...'
+    print(f\"{c['code']:>4s}  {c['name']:<28s} {c['server_count']:>3d}  {cities}\")
+print(f\"\nTotal: {d['total_servers']} active servers\")
+if d.get('stale'): print('(server list is stale — will refresh on next host-side operation)')
+" 2>/dev/null
+    fi
+    ;;
+  rotate|r)
+    if [ -n "$2" ]; then
+      curl -sf -X POST -H 'Content-Type: application/json' \
+        -d "{\"location\":\"$2\"}" "$API/rotate" | python3 -m json.tool 2>/dev/null
+    else
+      curl -sf -X POST "$API/rotate" | python3 -m json.tool 2>/dev/null
+    fi
+    ;;
+  auto-rotate|ar)
+    if [ "$2" = "off" ] || [ "$2" = "0" ] || [ "$2" = "stop" ]; then
+      curl -sf -X DELETE "$API/auto-rotate" | python3 -m json.tool 2>/dev/null
+    elif [ -n "$2" ]; then
+      curl -sf -X POST -H 'Content-Type: application/json' \
+        -d "{\"interval_minutes\":$2}" "$API/auto-rotate" | python3 -m json.tool 2>/dev/null
+    else
+      curl -sf "$API/auto-rotate" | python3 -m json.tool 2>/dev/null
+    fi
+    ;;
+  help|--help|-h|*)
+    cat << EOF
+Usage: vpn <command> [args]
+
+Commands:
+  status              Show current WireGuard connection status
+  locations [filter]  List available server locations
+  rotate [country]    Rotate to a new WG endpoint (e.g., vpn rotate de)
+  auto-rotate [min]   Auto-rotate every N minutes (off to disable, no arg for status)
+
+Examples:
+  vpn status
+  vpn locations
+  vpn locations us
+  vpn rotate jp
+  vpn auto-rotate 30
+  vpn auto-rotate off
+EOF
+    ;;
+esac
+VPNEOF
+    chmod +x "$rootfs/usr/local/bin/vpn"
+
+    # Create the qcow2 image
+    # Size: 1G should be plenty for Alpine base
+    local raw_img="${workdir}/rootfs.raw"
+    truncate -s 1G "$raw_img"
+    mkfs.ext4 -q -d "$rootfs" "$raw_img"
+
+    qemu-img convert -f raw -O qcow2 "$raw_img" "$BASE_IMAGE"
+
+    # Clean up
+    rm -rf "$workdir"
+
+    info "Base image created at $BASE_IMAGE ($(du -h "$BASE_IMAGE" | cut -f1))"
+}
+
+_get_kernel() {
+    # Allow user-supplied kernel
+    if [[ -n "${PARANOID_KERNEL:-}" ]]; then
+        [[ -f "$PARANOID_KERNEL" ]] || die "PARANOID_KERNEL=$PARANOID_KERNEL does not exist"
+        cp "$PARANOID_KERNEL" "$VMLINUZ"
+        info "Using custom kernel: $PARANOID_KERNEL ($(du -h "$VMLINUZ" | cut -f1))"
+        return 0
+    fi
+
+    local kernel_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/${ALPINE_ARCH}/vmlinux-6.1.102"
+    local kernel_sha256="cf42303c29e8c4a02798f357ba056c5567baf074aaed4eec78c997fb9df08cf9"
+
+    info "Downloading microvm kernel..."
+    curl -sS -L --max-time 120 -o "$VMLINUZ" "$kernel_url" \
+        || die "Kernel download failed"
+
+    local actual_hash
+    actual_hash=$(sha256sum "$VMLINUZ" | awk '{print $1}')
+    if [[ "$actual_hash" != "$kernel_sha256" ]]; then
+        rm -f "$VMLINUZ"
+        die "Kernel SHA256 mismatch (expected ${kernel_sha256:0:16}..., got ${actual_hash:0:16}...).
+  Set PARANOID_KERNEL=/path/to/vmlinuz to use your own, or update the hash in the script."
+    fi
+    info "Kernel verified: $(du -h "$VMLINUZ" | cut -f1)"
+}
+
+# --- QEMU launch ---
+
+_launch_qemu() {
+    local name="$1"
+    local ns="$2"
+    local tap_name="$3"
+    local ram="$4"
+    local cpus="$5"
+    local overlay="$6"
+    local vm_ip="$7"
+    local vm_gw="$8"
+    local disk_secret="$9"
+    local use_sev="${10:-0}"
+    local max_cpu="${11:-0}"
+    local max_mem="${12:-0}"
+    local ssh_key_path="${13:-}"
+    local monitor_sock="${VMS_DIR}/${name}/monitor.sock"
+
+    local qemu_cmd=(
+        qemu-system-x86_64
+        -enable-kvm
+        -cpu host
+        -m "$ram"
+        -smp "$cpus"
+        -nodefaults
+        -no-user-config
+        -nographic
+    )
+
+    # Machine type: microvm unless SEV requested (SEV requires Q35 + OVMF)
+    if [[ "$use_sev" == "1" ]]; then
+        qemu_cmd+=(
+            -M "q35,confidential-guest-support=sev0"
+            -object "sev-guest,id=sev0,cbitpos=51,reduced-phys-bits=1"
+            -bios /usr/share/edk2/x64/OVMF.fd
+        )
+        info "AMD SEV: memory encryption ACTIVE"
+    else
+        qemu_cmd+=(
+            -M "microvm,isa-serial=on,rtc=off,pit=off,pic=off"
+        )
+    fi
+
+    qemu_cmd+=(
+        # Kernel — direct boot (no bootloader)
+        -kernel "$VMLINUZ"
+        -append "console=ttyS0 root=/dev/vda rw quiet vm_ip=${vm_ip}/24 vm_gw=${vm_gw} vm_dns=${MULLVAD_DNS} init=/sbin/micro-init"
+
+        # Disk encryption secret (via file on secrets tmpfs — not visible in /proc/cmdline)
+        -object "secret,id=diskenc0,file=${VMS_DIR}/${name}/.secrets/disk.key"
+
+        # Storage: LUKS-encrypted qcow2 overlay
+        -drive "id=rootfs,file=${overlay},format=qcow2,encrypt.key-secret=diskenc0,if=none,cache=unsafe"
+        -device "virtio-blk-device,drive=rootfs"
+
+        # Network: virtio-net-device connected to TAP in namespace
+        -netdev "tap,id=net0,ifname=${tap_name},script=no,downscript=no"
+        -device "virtio-net-device,netdev=net0"
+
+        # Serial console on stdio
+        -serial stdio
+
+        # Monitor socket for management
+        -chardev "socket,id=monitor,path=${monitor_sock},server=on,wait=off"
+        -mon "chardev=monitor,mode=control"
+
+        # Misc
+        -pidfile "${VMS_DIR}/${name}/qemu.pid"
+
+        # Seccomp sandbox — restrict QEMU's own syscalls post-launch
+        -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny
+    )
+
+    debug "QEMU command: ${qemu_cmd[*]}"
+
+    # Launch inside the network namespace
+    # Use daemonize approach for non-interactive start, or stdio for interactive
+    if [[ "${PARANOID_DETACH:-0}" == "1" ]]; then
+        # Detached mode: redirect to log
+        ip netns exec "$ns" "${qemu_cmd[@]}" \
+            </dev/null \
+            >"${VMS_DIR}/${name}/console.log" \
+            2>&1 &
+        local qemu_pid=$!
+        echo "$qemu_pid" > "${VMS_DIR}/${name}/vm.pid"
+        # Give it a moment to start
+        sleep 1
+        if kill -0 "$qemu_pid" 2>/dev/null; then
+            info "VM '$name' started (PID: $qemu_pid, detached)"
+
+            # Apply cgroup resource limits
+            if [[ "$max_cpu" -gt 0 || "$max_mem" -gt 0 ]]; then
+                _setup_cgroup "$name" "$qemu_pid" "$max_cpu" "$max_mem"
+            fi
+
+            # Wait for SSH readiness
+            if [[ -n "$ssh_key_path" ]]; then
+                _wait_for_ssh "$ns" "$vm_ip" "$ssh_key_path" 30
+            fi
+        else
+            die "QEMU failed to start. Check ${VMS_DIR}/${name}/console.log"
+        fi
+    else
+        # Interactive mode: serial console on stdio
+        info "Starting VM '$name' — serial console attached (Ctrl-a x to exit QEMU)"
+        echo "$BASHPID" > "${VMS_DIR}/${name}/vm.pid"
+        exec ip netns exec "$ns" "${qemu_cmd[@]}"
+    fi
+}
+
+# --- Commands ---
+
+cmd_setup() {
+    require_root
+
+    local mullvad_account=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mullvad-account) mullvad_account="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    info "Setting up paranoid environment..."
+
+    _install_packages
+
+    # Create directories
+    mkdir -p "$CONFIG_DIR" "$BASE_DIR" "$VMS_DIR"
+    chmod 700 "$CONFIG_DIR"
+
+    # Initialize encryption vault
+    _vault_init
+
+    # Mullvad WireGuard config
+    if [[ -f "${MULLVAD_CONF}.enc" ]] && [[ -z "$mullvad_account" ]]; then
+        info "Mullvad config already encrypted"
+    elif [[ -n "$mullvad_account" ]]; then
+        # Auto-register via Mullvad API
+        [[ "$mullvad_account" =~ ^[0-9]{16}$ ]] \
+            || die "Invalid Mullvad account number (expected 16 digits)"
+        local reg_output
+        reg_output=$(_mullvad_register_key "$mullvad_account")
+        local conf_tmp
+        conf_tmp=$(mktemp /dev/shm/.paranoid-conf-XXXXXX)
+        echo "$reg_output" > "$conf_tmp"
+        chmod 600 "$conf_tmp"
+        _encrypt_file "$conf_tmp" "${MULLVAD_CONF}.enc"
+        _secure_delete "$conf_tmp"
+        info "Mullvad WG key registered and encrypted"
+    elif [[ -f "$MULLVAD_CONF" ]]; then
+        if grep -q 'YOUR_PRIVATE_KEY_HERE' "$MULLVAD_CONF" 2>/dev/null; then
+            warn "Edit $MULLVAD_CONF with real credentials, then re-run setup."
+        else
+            info "Encrypting mullvad.conf..."
+            _encrypt_file "$MULLVAD_CONF" "${MULLVAD_CONF}.enc"
+            _secure_delete "$MULLVAD_CONF"
+            info "Mullvad config encrypted"
+        fi
+    else
+        warn "No Mullvad config. Use --mullvad-account <16-digit-number> to auto-register,"
+        warn "or create $MULLVAD_CONF manually with private_key= and address= fields."
+    fi
+
+    # AMD SEV status
+    if _sev_available; then
+        info "AMD SEV: available (use --sev flag for memory-encrypted VMs)"
+    else
+        info "AMD SEV: not available on this CPU (disk + network encryption active)"
+    fi
+
+    # Fetch server list
+    _refresh_servers || warn "Could not fetch server list (will retry on start)"
+
+    # Build kernel
+    if [[ ! -f "$VMLINUZ" ]]; then
+        _get_kernel
+    else
+        info "Kernel already exists at $VMLINUZ"
+    fi
+
+    # Build base image
+    if [[ ! -f "$BASE_IMAGE" ]]; then
+        _build_base_image
+    else
+        info "Base image already exists at $BASE_IMAGE"
+    fi
+
+    info "Setup complete!"
+    info ""
+    info "Encryption layers active:"
+    info "  Vault:   AES-256-CBC + PBKDF2 (${KDF_ITER} iterations)"
+    info "  Disk:    LUKS (AES-256-XTS) on all VM overlays"
+    info "  Network: WireGuard (ChaCha20-Poly1305)"
+    info "  Secrets: encrypted at rest (mullvad key, SSH keys)"
+    if _sev_available; then
+        info "  Memory:  AMD SEV available (--sev flag)"
+    fi
+}
+
+cmd_start() {
+    require_root
+    check_deps
+    _mullvad_conf_check
+
+    # Unlock vault early — fail fast on wrong passphrase, then scrub env
+    _vault_unlock > /dev/null
+    unset PARANOID_PASSPHRASE 2>/dev/null || true
+
+    local name="" location="" ram=$DEFAULT_RAM cpus=$DEFAULT_CPUS detach=0
+    local local_inference="" use_sev=0
+    local auto_rotate=0 max_cpu=0 max_mem=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)     name="$2"; shift 2 ;;
+            --location) location="$2"; shift 2 ;;
+            --ram)      ram="$2"; shift 2 ;;
+            --cpus)     cpus="$2"; shift 2 ;;
+            --detach|-d) detach=1; shift ;;
+            --local-inference) local_inference="$2"; shift 2 ;;
+            --sev)      use_sev=1; shift ;;
+            --auto-rotate) auto_rotate="$2"; shift 2 ;;
+            --max-cpu)  max_cpu="$2"; shift 2 ;;
+            --max-mem)  max_mem="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    # Validate SEV if requested
+    if [[ "$use_sev" == "1" ]]; then
+        _sev_available || die "AMD SEV not available on this CPU (requires EPYC or SEV-enabled Ryzen)"
+    fi
+
+    # Validate location code
+    if [[ -n "$location" ]]; then
+        [[ "$location" =~ ^[a-z]{2}$ ]] || die "Invalid location: '$location' (use 2-letter country code: us, de, gb, jp, ...)"
+    fi
+
+    # Parse inference endpoint early so we fail fast on bad input
+    local inference_host="" inference_port=""
+    if [[ -n "$local_inference" ]]; then
+        read -r inference_host inference_port <<< "$(_parse_inference_arg "$local_inference")"
+    fi
+
+    # Generate name if not provided
+    if [[ -z "$name" ]]; then
+        name="vm-$(date +%s | tail -c 6)"
+    fi
+
+    # Validate name (alphanumeric + dash only)
+    [[ "$name" =~ ^[a-zA-Z0-9][-a-zA-Z0-9]*$ ]] || die "Invalid VM name: '$name' (use alphanumeric and dashes)"
+
+    local vm_dir="${VMS_DIR}/${name}"
+    local resuming=0
+
+    if [[ -d "$vm_dir" ]]; then
+        # Check if it's a stopped VM with preserved state (overlay + keys exist)
+        if [[ -f "${vm_dir}/overlay.qcow2" && -f "${vm_dir}/ssh_key.enc" && -f "${vm_dir}/vm.meta" ]]; then
+            # Check it's not actually running
+            local old_ns; old_ns=$(jq -r '.namespace // empty' "${vm_dir}/vm.meta" 2>/dev/null)
+            if [[ -n "$old_ns" ]] && ip netns list 2>/dev/null | grep -q "^${old_ns}"; then
+                die "VM '$name' is still running. Stop it first."
+            fi
+            resuming=1
+            info "Resuming VM '$name' (disk preserved from previous run)"
+        else
+            die "VM '$name' directory exists but is incomplete. Run: sudo $PROG stop $name --destroy"
+        fi
+    fi
+
+    mkdir -p "$vm_dir"
+
+    # Set up trap for cleanup
+    trap "cleanup_on_exit '$name'" INT TERM
+
+    # Pick a server
+    info "Selecting Mullvad server${location:+ in $location}..."
+    local server_json
+    server_json=$(_pick_server "$location")
+
+    local server_hostname server_country server_city endpoint pubkey
+    server_hostname=$(echo "$server_json" | jq -r '.hostname')
+    server_country=$(echo "$server_json" | jq -r '.country_code')
+    server_city=$(echo "$server_json" | jq -r '.city_name')
+    endpoint=$(echo "$server_json" | jq -r '.ipv4_addr_in')
+    pubkey=$(echo "$server_json" | jq -r '.pubkey')
+
+    info "Selected: ${server_hostname} (${server_city}, ${server_country}) @ ${endpoint}"
+
+    local vm_index
+    mkdir -p "$VMS_DIR"
+    exec 9>"${VMS_DIR}/.lock"
+    flock -x 9
+    if [[ "$resuming" == "1" ]]; then
+        # Reuse saved index so IPs match what's baked in /etc/hosts
+        vm_index=$(jq -r '.vm_index' "${vm_dir}/vm.meta")
+    else
+        vm_index=$(_alloc_vm_index)
+    fi
+    local tap_subnet="${VM_SUBNET}.${vm_index}.0/24"
+    local tap_addr="${VM_SUBNET}.${vm_index}.1/24"
+    local tap_addr_bare="${VM_SUBNET}.${vm_index}.1"
+    local vm_ip="${VM_SUBNET}.${vm_index}.2"
+
+    # Naming
+    local ns="${NS_PREFIX}-${name}"
+    local wg_iface="${WG_PREFIX}-${name}"
+    local tap_name="${TAP_PREFIX}-${name}"
+
+    # Truncate interface names to 15 chars (Linux limit)
+    wg_iface="${wg_iface:0:15}"
+    tap_name="${tap_name:0:15}"
+
+    local wg_privkey wg_address
+    _mullvad_read
+    wg_privkey="$_MULLVAD_KEY"
+    wg_address="$_MULLVAD_ADDR"
+
+    if [[ "$resuming" == "0" ]]; then
+    # --- First-time VM creation: generate keys, create overlay, inject SSH ---
+    info "Generating SSH keypair..."
+    ssh-keygen -t ed25519 -f "${vm_dir}/ssh_key" -N "" -q
+
+    # Encrypt SSH private key at rest
+    _encrypt_file "${vm_dir}/ssh_key" "${vm_dir}/ssh_key.enc"
+    # Keep plaintext in a secrets tmpfs for runtime use
+    local secrets_dir="${vm_dir}/.secrets"
+    _create_secrets_tmpfs "$secrets_dir"
+    cp "${vm_dir}/ssh_key" "${secrets_dir}/ssh_key"
+    chmod 600 "${secrets_dir}/ssh_key"
+    _secure_delete "${vm_dir}/ssh_key"
+
+    # Generate per-VM disk encryption secret
+    local disk_secret
+    disk_secret=$(openssl rand -base64 32)
+    # Store on secrets tmpfs (runtime only — never in /proc/cmdline)
+    echo "$disk_secret" > "${secrets_dir}/disk.key"
+    chmod 600 "${secrets_dir}/disk.key"
+    # Store encrypted copy on disk for persistence
+    local _mk; _mk=$(_vault_unlock)
+    echo "$disk_secret" | openssl enc -${CIPHER} -pbkdf2 -iter ${KDF_ITER} \
+        -pass "fd:3" -out "${vm_dir}/disk.key.enc" 3< <(echo -n "$_mk") 2>/dev/null
+    chmod 600 "${vm_dir}/disk.key.enc"
+
+    # Create LUKS-encrypted overlay image
+    info "Creating encrypted overlay image (LUKS/AES-256-XTS)..."
+    qemu-img create -f qcow2 \
+        --object "secret,id=sec0,file=${secrets_dir}/disk.key" \
+        -o "encrypt.format=luks,encrypt.key-secret=sec0" \
+        -b "$BASE_IMAGE" -B qcow2 \
+        "${vm_dir}/overlay.qcow2" 2G
+
+    # Inject SSH public key into the overlay
+    # We need to mount the overlay temporarily to inject the key
+    local mnt
+    mnt=$(mktemp -d)
+    # Load nbd module
+    modprobe nbd max_part=8 2>/dev/null || true
+
+    # Find a free nbd device (check if anything is connected via /sys)
+    local nbd_dev=""
+    for dev in /dev/nbd{0..15}; do
+        if [[ -b "$dev" ]]; then
+            local sysdev="/sys/block/$(basename "$dev")/pid"
+            if [[ ! -f "$sysdev" ]]; then
+                nbd_dev="$dev"
+                break
+            fi
+        fi
+    done
+    [[ -z "$nbd_dev" ]] && die "No free nbd device found (all /dev/nbd0-15 in use)"
+
+    # Set up cleanup trap for nbd (in case of interrupt during mount/inject phase)
+    _nbd_cleanup() {
+        umount "$mnt" 2>/dev/null || true
+        qemu-nbd --disconnect "$nbd_dev" 2>/dev/null || true
+        rmdir "$mnt" 2>/dev/null || true
+    }
+    trap '_nbd_cleanup; cleanup_on_exit "'"$name"'"' INT TERM
+
+    qemu-nbd --connect="$nbd_dev" \
+        --object "secret,id=sec0,file=${secrets_dir}/disk.key" \
+        --image-opts "driver=qcow2,encrypt.key-secret=sec0,file.driver=file,file.filename=${vm_dir}/overlay.qcow2"
+    sleep 0.5
+    # Wait for device to appear
+    local waited=0
+    while [[ ! -b "$nbd_dev" ]] && [[ $waited -lt 5 ]]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    mount "$nbd_dev" "$mnt" 2>/dev/null || {
+        # Might need partition
+        partprobe "$nbd_dev" 2>/dev/null || true
+        sleep 0.5
+        mount "${nbd_dev}p1" "$mnt" 2>/dev/null || mount "$nbd_dev" "$mnt" || {
+            qemu-nbd --disconnect "$nbd_dev"
+            die "Failed to mount overlay image"
+        }
+    }
+
+    # Inject SSH key
+    mkdir -p "$mnt/home/agent/.ssh"
+    cp "${vm_dir}/ssh_key.pub" "$mnt/home/agent/.ssh/authorized_keys"
+    chmod 600 "$mnt/home/agent/.ssh/authorized_keys"
+    chown -R 1000:1000 "$mnt/home/agent/.ssh"  # agent user is typically UID 1000
+
+    # Also allow root SSH for convenience
+    mkdir -p "$mnt/root/.ssh"
+    cp "${vm_dir}/ssh_key.pub" "$mnt/root/.ssh/authorized_keys"
+    chmod 600 "$mnt/root/.ssh/authorized_keys"
+
+    # Fix sshd_config to also allow root (optional, for debugging)
+    if [[ -f "$mnt/etc/ssh/sshd_config" ]]; then
+        sed -i 's/^PermitRootLogin no/PermitRootLogin prohibit-password/' "$mnt/etc/ssh/sshd_config"
+    fi
+
+    # Inject /etc/hosts entry for inference.local if pinhole requested
+    if [[ -n "$inference_host" ]]; then
+        echo "${tap_addr_bare}  inference.local" >> "$mnt/etc/hosts"
+    fi
+
+    # Generate DOCS.md for the agent
+    cat > "$mnt/home/agent/DOCS.md" << 'DOCSEOF'
+# paranoid VM
+
+You are inside an isolated QEMU microVM. All internet traffic exits
+through a WireGuard VPN tunnel. You have root access via `doas`.
+
+## VPN control
+
+    vpn status            # current server, WG health, transfer stats
+    vpn locations         # all available countries/servers
+    vpn locations <cc>    # filter (e.g. vpn locations us)
+    vpn rotate            # switch to a random new server
+    vpn rotate <cc>       # switch to a specific country (e.g. vpn rotate jp)
+    vpn auto-rotate 30    # rotate every 30 minutes
+    vpn auto-rotate off   # disable auto-rotation
+
+## Package management
+
+    doas apk add <pkg>    # install packages (runs through VPN tunnel)
+    doas apk update       # refresh package index
+
+## Networking
+
+All traffic goes through WireGuard. There is no direct internet access.
+DNS resolves through Mullvad (10.64.0.1). IPv6 is disabled.
+DOCSEOF
+
+    if [[ -n "$inference_host" ]]; then
+        cat >> "$mnt/home/agent/DOCS.md" << INFEOF
+
+## Local inference API
+
+An OpenAI-compatible inference endpoint is available at:
+
+    http://inference.local:${INFERENCE_PORT}
+
+This connects directly to ${inference_host}:${inference_port} on the host
+LAN. It does NOT go through the VPN tunnel.
+
+    # List models
+    curl -s http://inference.local:${INFERENCE_PORT}/v1/models
+
+    # Chat completion
+    curl -s http://inference.local:${INFERENCE_PORT}/v1/chat/completions \\
+      -H "Content-Type: application/json" \\
+      -d '{"model":"default","messages":[{"role":"user","content":"hello"}]}'
+
+## Rescue agent
+
+A minimal AI agent with bash-only tool access for emergency recovery:
+
+    ~/rescue-agent "check disk usage and clean up tmp"
+    ~/rescue-agent   # interactive mode
+INFEOF
+    fi
+
+    chown 1000:1000 "$mnt/home/agent/DOCS.md"
+    chmod 644 "$mnt/home/agent/DOCS.md"
+
+    # Inject rescue agent (inference pinhole only)
+    if [[ -n "$inference_host" ]]; then
+        local rescue_src="$(_find_companion rescue-agent)"
+        if [[ -f "$rescue_src" ]]; then
+            cp "$rescue_src" "$mnt/home/agent/rescue-agent"
+            chown 1000:1000 "$mnt/home/agent/rescue-agent"
+            chmod 755 "$mnt/home/agent/rescue-agent"
+        else
+            warn "rescue-agent not found at $rescue_src — skipping"
+        fi
+    fi
+
+    sync
+    umount "$mnt"
+    qemu-nbd --disconnect "$nbd_dev"
+    sleep 0.3
+    rmdir "$mnt"
+
+    # Restore normal trap (nbd phase complete)
+    trap "cleanup_on_exit '$name'" INT TERM
+
+    fi  # end if resuming == 0
+
+    # Resume path: decrypt keys to secrets tmpfs
+    if [[ "$resuming" == "1" ]]; then
+        local secrets_dir="${vm_dir}/.secrets"
+        _create_secrets_tmpfs "$secrets_dir"
+        _decrypt_file "${vm_dir}/ssh_key.enc" "${secrets_dir}/ssh_key"
+        chmod 600 "${secrets_dir}/ssh_key"
+        # Decrypt disk key
+        local disk_secret
+        local _mk; _mk=$(_vault_unlock)
+        disk_secret=$(openssl enc -${CIPHER} -d -pbkdf2 -iter ${KDF_ITER} \
+            -pass "fd:3" -in "${vm_dir}/disk.key.enc" 3< <(echo -n "$_mk") 2>/dev/null)
+        echo "$disk_secret" > "${secrets_dir}/disk.key"
+        chmod 600 "${secrets_dir}/disk.key"
+    fi
+
+    # --- Networking setup (WG in root, veth to namespace, structural kill switch) ---
+
+    info "Creating network namespace $ns..."
+    _create_namespace "$ns"
+
+    info "Configuring WireGuard tunnel (root namespace)..."
+    _setup_wireguard "$wg_iface" "$wg_privkey" "$wg_address" "$server_json"
+
+    info "Creating veth link to namespace..."
+    local veth_result veth_ns veth_host veth_ns_ip veth_host_ip rt_table
+    veth_result=$(_setup_veth "$ns" "$vm_index" "$wg_iface")
+    read -r veth_ns veth_host veth_ns_ip veth_host_ip rt_table <<< "$veth_result"
+
+    info "Creating TAP device..."
+    _setup_tap "$ns" "$tap_name" "$tap_addr"
+
+    info "Applying firewall rules..."
+    local veth_subnet="${VETH_SUBNET}.${vm_index}.0/30"
+    _setup_root_firewall "$name" "$wg_iface" "$veth_host" "$veth_subnet"
+    _setup_ns_firewall "$ns" "$veth_ns" "$tap_subnet"
+
+    # Inference pinhole (reuses existing veth — just adds DNAT rules)
+    local inference_json="null"
+    if [[ -n "$inference_host" ]]; then
+        _setup_inference_pinhole "$ns" "$name" "$veth_host" \
+            "$inference_host" "$inference_port" "$tap_addr_bare" "$veth_subnet" "$rt_table" "$vm_ip"
+        inference_json="{\"host\":\"${inference_host}\",\"port\":${inference_port},\"vm_endpoint\":\"http://inference.local:${INFERENCE_PORT}\"}"
+    fi
+
+    # Save metadata
+    cat > "${vm_dir}/vm.meta" << EOF
+{
+    "name": "${name}",
+    "namespace": "${ns}",
+    "wg_iface": "${wg_iface}",
+    "tap_name": "${tap_name}",
+    "vm_index": ${vm_index},
+    "veth_ns": "${veth_ns}",
+    "veth_host": "${veth_host}",
+    "veth_ns_ip": "${veth_ns_ip}",
+    "veth_host_ip": "${veth_host_ip}",
+    "rt_table": ${rt_table},
+    "tap_subnet": "${tap_subnet}",
+    "tap_addr": "${tap_addr_bare}",
+    "vm_ip": "${vm_ip}",
+    "ram": ${ram},
+    "cpus": ${cpus},
+    "server_hostname": "${server_hostname}",
+    "server_country": "${server_country}",
+    "server_city": "${server_city}",
+    "server_endpoint": "${endpoint}:51820",
+    "server_pubkey": "${pubkey}",
+    "inference": ${inference_json},
+    "started_at": "$(date -Iseconds)",
+    "started_at_epoch": $(date +%s)
+}
+EOF
+
+    # Release VM index allocation lock (vm.meta now written)
+    exec 9>&-
+
+    info "VM '$name': $server_hostname ($server_country), VM IP $vm_ip"
+    info "  SSH: sudo $PROG ssh $name | Control: vpn status/rotate (inside VM)"
+    [[ -n "$inference_host" ]] && info "  Inference: http://inference.local:${INFERENCE_PORT} -> ${inference_host}:${inference_port}"
+
+    # Start control plane API before QEMU (so it's ready when VM boots)
+    _start_controlplane "$ns" "$tap_addr_bare" "${vm_dir}/vm.meta" \
+        "$wg_iface" "$vm_dir" "$auto_rotate"
+
+    # Launch QEMU
+    PARANOID_DETACH="$detach" _launch_qemu \
+        "$name" "$ns" "$tap_name" "$ram" "$cpus" \
+        "${vm_dir}/overlay.qcow2" "$vm_ip" "$tap_addr_bare" \
+        "$disk_secret" "$use_sev" "$max_cpu" "$max_mem" \
+        "${secrets_dir}/ssh_key"
+}
+
+_do_stop() {
+    local name="$1"
+    local vm_dir="${VMS_DIR}/${name}"
+    local meta="${vm_dir}/vm.meta"
+
+    if [[ ! -f "$meta" ]]; then
+        warn "No metadata for VM '$name' — cleaning up directory"
+        _destroy_secrets_tmpfs "${vm_dir}/.secrets"
+        rm -rf "$vm_dir"
+        return 0
+    fi
+
+    local ns wg_iface tap_name
+    ns=$(jq -r '.namespace' "$meta")
+    wg_iface=$(jq -r '.wg_iface' "$meta")
+    tap_name=$(jq -r '.tap_name' "$meta")
+
+    # Stop control plane first
+    _stop_controlplane "$vm_dir"
+
+    # Tear down cgroup
+    _teardown_cgroup "$name"
+
+    # Graceful shutdown via QMP monitor first, then SIGTERM/SIGKILL fallback
+    local monitor_sock="${vm_dir}/monitor.sock"
+    if [[ -S "$monitor_sock" ]]; then
+        printf '{"execute":"qmp_capabilities"}\n{"execute":"quit"}\n' | socat - "UNIX-CONNECT:${monitor_sock}" >/dev/null 2>&1 || true
+        sleep 1
+    fi
+
+    for pidfile in "${vm_dir}/vm.pid" "${vm_dir}/qemu.pid"; do
+        if [[ -f "$pidfile" ]]; then
+            local pid
+            pid=$(cat "$pidfile")
+            if kill -0 "$pid" 2>/dev/null; then
+                info "Stopping QEMU (PID: $pid)..."
+                kill "$pid" 2>/dev/null || true
+                local i=0
+                while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
+                    sleep 0.5; i=$((i + 1))
+                done
+                kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+            fi
+            rm -f "$pidfile"
+        fi
+    done
+
+    # Tear down host-side rules (iptables FORWARD + NAT for both WG and inference)
+    info "Removing host firewall rules..."
+    _teardown_host_rules "$name"
+    # Also remove inference-specific rules
+    _teardown_host_rules "${name}-inf"
+
+    # Tear down policy routing
+    local veth_host rt_table
+    veth_host=$(jq -r '.veth_host // empty' "$meta" 2>/dev/null)
+    rt_table=$(jq -r '.rt_table // empty' "$meta" 2>/dev/null)
+    if [[ -n "$rt_table" ]]; then
+        ip rule del table "$rt_table" 2>/dev/null || true
+        ip route flush table "$rt_table" 2>/dev/null || true
+    fi
+
+    # Tear down host-side veth
+    [[ -n "$veth_host" ]] && ip link delete "$veth_host" 2>/dev/null || true
+
+    # Tear down network namespace
+    if ip netns list 2>/dev/null | grep -q "^${ns}" 2>/dev/null; then
+        info "Removing namespace $ns..."
+        ip netns exec "$ns" nft flush ruleset 2>/dev/null || true
+        ip netns delete "$ns" 2>/dev/null || true
+    fi
+
+    # Delete WG interface (in root)
+    ip link delete "$wg_iface" 2>/dev/null || true
+
+    # Clean up secrets tmpfs (runtime keys gone)
+    _destroy_secrets_tmpfs "${vm_dir}/.secrets"
+
+    if [[ "${_DESTROY_VM:-0}" == "1" ]]; then
+        _secure_delete "${vm_dir}/ssh_key" 2>/dev/null
+        _secure_delete "${vm_dir}/disk.key.enc" 2>/dev/null
+        rm -rf "$vm_dir"
+        info "VM '$name' stopped and destroyed"
+    else
+        # Keep overlay + encrypted keys + metadata for restart
+        rm -f "${vm_dir}/vm.pid" "${vm_dir}/qemu.pid" "${vm_dir}/controlplane.pid"
+        rm -f "${vm_dir}/monitor.sock" "${vm_dir}/console.log" "${vm_dir}/controlplane.log"
+        rmdir "${vm_dir}/.secrets" 2>/dev/null || true
+        info "VM '$name' stopped (disk preserved, encrypted)"
+    fi
+}
+
+cmd_stop() {
+    require_root
+
+    local name="" destroy=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --destroy) destroy=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+    [[ -z "$name" ]] && die "Usage: $PROG stop <vm-name> [--destroy]"
+
+    _DESTROY_VM="$destroy" _do_stop "$name"
+}
+
+cmd_rotate() {
+    require_root
+    check_deps
+    _mullvad_conf_check
+    _vault_unlock > /dev/null
+    unset PARANOID_PASSPHRASE 2>/dev/null || true
+
+    local name="${1:-}"
+    shift || true
+    local location=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --location) location="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    [[ -z "$name" ]] && die "Usage: $PROG rotate <vm-name> [--location <country>]"
+    if [[ -n "$location" ]]; then
+        [[ "$location" =~ ^[a-z]{2}$ ]] || die "Invalid location: '$location' (use 2-letter country code)"
+    fi
+
+    local vm_dir="${VMS_DIR}/${name}"
+    local meta="${vm_dir}/vm.meta"
+    [[ -f "$meta" ]] || die "VM '$name' not found"
+
+    local ns wg_iface current_hostname
+    ns=$(jq -r '.namespace' "$meta")
+    wg_iface=$(jq -r '.wg_iface' "$meta")
+    current_hostname=$(jq -r '.server_hostname' "$meta")
+
+    # Pick new server (different from current)
+    info "Rotating WireGuard endpoint (current: $current_hostname)..."
+    local server_json
+    server_json=$(_pick_server "$location" "$current_hostname")
+
+    local new_hostname new_country new_city new_endpoint new_pubkey
+    new_hostname=$(echo "$server_json" | jq -r '.hostname')
+    new_country=$(echo "$server_json" | jq -r '.country_code')
+    new_city=$(echo "$server_json" | jq -r '.city_name')
+    new_endpoint=$(echo "$server_json" | jq -r '.ipv4_addr_in')
+    new_pubkey=$(echo "$server_json" | jq -r '.pubkey')
+
+    # Validate (prevent injection via tampered servers.json)
+    [[ "$new_endpoint" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid server IP: $new_endpoint"
+    [[ "$new_pubkey" =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "Invalid server pubkey format"
+
+    info "Rotating to: ${new_hostname} (${new_city}, ${new_country}) @ ${new_endpoint}"
+
+    # Shared lock with control plane (prevents concurrent rotation races)
+    exec 8>"${vm_dir}/vm.meta.lock"
+    flock -x 8
+
+    # Re-read meta under lock for authoritative old_pubkey
+    local old_pubkey
+    old_pubkey=$(jq -r '.server_pubkey // empty' "$meta")
+    [[ -n "$old_pubkey" ]] && wg set "$wg_iface" peer "$old_pubkey" remove 2>/dev/null
+    wg set "$wg_iface" \
+        peer "$new_pubkey" \
+        endpoint "${new_endpoint}:51820" \
+        allowed-ips "0.0.0.0/0" \
+        persistent-keepalive 25
+
+    local tmp_meta
+    tmp_meta=$(mktemp "${meta}.XXXXXX")
+    jq --arg h "$new_hostname" --arg c "$new_country" --arg ci "$new_city" \
+       --arg e "${new_endpoint}:51820" --arg p "$new_pubkey" \
+       '.server_hostname=$h | .server_country=$c | .server_city=$ci | .server_endpoint=$e | .server_pubkey=$p' \
+       "$meta" > "$tmp_meta"
+    mv "$tmp_meta" "$meta"
+
+    exec 8>&-
+
+    info "Rotation complete: $current_hostname -> $new_hostname"
+
+    # Show new WG status
+    wg show "$wg_iface" endpoints 2>/dev/null
+}
+
+cmd_list() {
+    # Don't require root for list — but namespace queries need it
+    if [[ $EUID -ne 0 ]]; then
+        warn "Run as root for full status information"
+    fi
+
+    if [[ ! -d "$VMS_DIR" ]] || [[ -z "$(ls -A "$VMS_DIR" 2>/dev/null)" ]]; then
+        echo "No VMs found."
+        return 0
+    fi
+
+    printf "${BOLD}%-15s %-8s %-25s %-12s %-18s %-10s${RESET}\n" \
+        "NAME" "STATUS" "SERVER" "COUNTRY" "VM IP" "UPTIME"
+    printf "%s\n" "$(printf '%.0s─' {1..95})"
+
+    for vm_dir in "$VMS_DIR"/*/; do
+        [[ -d "$vm_dir" ]] || continue
+        local name
+        name=$(basename "$vm_dir")
+        local meta="${vm_dir}/vm.meta"
+
+        if [[ ! -f "$meta" ]]; then
+            printf "%-15s %-8s %-25s\n" "$name" "${RED}BROKEN${RESET}" "(no metadata)"
+            continue
+        fi
+
+        local hostname country vm_ip started_epoch ns status uptime_str
+        hostname=$(jq -r '.server_hostname // "?"' "$meta")
+        country=$(jq -r '.server_country // "?"' "$meta")
+        vm_ip=$(jq -r '.vm_ip // "?"' "$meta")
+        started_epoch=$(jq -r '.started_at_epoch // 0' "$meta")
+        ns=$(jq -r '.namespace // ""' "$meta")
+
+        # Check if running
+        status="${RED}DEAD${RESET}"
+        if [[ -n "$ns" ]] && ip netns list 2>/dev/null | grep -q "^${ns}"; then
+            # Check if QEMU is running
+            local pid=""
+            for pidfile in "${vm_dir}/vm.pid" "${vm_dir}/qemu.pid"; do
+                [[ -f "$pidfile" ]] && pid=$(cat "$pidfile") && break
+            done
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                status="${GREEN}RUNNING${RESET}"
+            else
+                status="${YELLOW}NS ONLY${RESET}"
+            fi
+        fi
+
+        # Calculate uptime
+        uptime_str="-"
+        if [[ "$started_epoch" -gt 0 ]]; then
+            local elapsed=$(( $(date +%s) - started_epoch ))
+            local hours=$((elapsed / 3600))
+            local mins=$(( (elapsed % 3600) / 60 ))
+            uptime_str="${hours}h${mins}m"
+        fi
+
+        # Check for inference pinhole
+        local inf_marker=""
+        if jq -e '.inference != null' "$meta" &>/dev/null; then
+            inf_marker=" [INF]"
+        fi
+
+        printf "%-15s %-18s %-25s %-12s %-18s %-10s\n" \
+            "$name" "$status" "$hostname" "${country}${inf_marker}" "$vm_ip" "$uptime_str"
+    done
+}
+
+# Helper: resolve SSH key path for a VM (decrypt from vault if needed)
+# Sets _SSH_KEY_PATH and _SSH_KEY_TMP (non-empty if caller must clean up)
+_resolve_ssh_key() {
+    local vm_dir="$1"
+    _SSH_KEY_PATH="${vm_dir}/.secrets/ssh_key"
+    _SSH_KEY_TMP=""
+    if [[ ! -f "$_SSH_KEY_PATH" ]]; then
+        if [[ -f "${vm_dir}/ssh_key.enc" ]]; then
+            _SSH_KEY_TMP=$(mktemp /dev/shm/.paranoid-sshkey-XXXXXX)
+            chmod 600 "$_SSH_KEY_TMP"
+            _decrypt_file "${vm_dir}/ssh_key.enc" "$_SSH_KEY_TMP"
+            _SSH_KEY_PATH="$_SSH_KEY_TMP"
+        else
+            die "No SSH key found in $vm_dir"
+        fi
+    fi
+}
+
+_cleanup_ssh_key() {
+    [[ -n "${_SSH_KEY_TMP:-}" ]] && _secure_delete "$_SSH_KEY_TMP"
+    _SSH_KEY_TMP=""
+}
+
+# Helper: resolve VM name → ns, vm_ip, vm_dir, meta (or die)
+_resolve_vm() {
+    local name="$1"
+    _VM_DIR="${VMS_DIR}/${name}"
+    _VM_META="${_VM_DIR}/vm.meta"
+    [[ -f "$_VM_META" ]] || die "VM '$name' not found"
+    _VM_NS=$(jq -r '.namespace' "$_VM_META")
+    _VM_IP=$(jq -r '.vm_ip' "$_VM_META")
+}
+
+cmd_ssh() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: $PROG ssh <vm-name>"
+    require_root
+
+    _resolve_vm "$name"
+    _resolve_ssh_key "$_VM_DIR"
+    trap '_cleanup_ssh_key' EXIT INT TERM
+
+    info "Connecting to ${name} (${_VM_IP})..."
+    ip netns exec "$_VM_NS" ssh -i "$_SSH_KEY_PATH" "${SSH_OPTS[@]}" "agent@${_VM_IP}"
+    local rc=$?
+    _cleanup_ssh_key
+    trap - EXIT INT TERM
+    return $rc
+}
+
+cmd_exec() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: $PROG exec <vm-name> -- <command>"
+    shift
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -eq 0 ]] && die "No command specified"
+    require_root
+
+    _resolve_vm "$name"
+    _resolve_ssh_key "$_VM_DIR"
+    trap '_cleanup_ssh_key' EXIT INT TERM
+
+    ip netns exec "$_VM_NS" ssh -i "$_SSH_KEY_PATH" "${SSH_OPTS[@]}" "agent@${_VM_IP}" "$@"
+    local rc=$?
+    _cleanup_ssh_key
+    trap - EXIT INT TERM
+    return $rc
+}
+
+cmd_cp() {
+    local src="${1:-}" dst="${2:-}"
+    [[ -z "$src" || -z "$dst" ]] && die "Usage: $PROG cp <vm-name>:<path> <local-path>
+       $PROG cp <local-path> <vm-name>:<path>"
+    require_root
+
+    local name="" remote_path="" local_path="" direction=""
+
+    # Parse src/dst to determine direction
+    if [[ "$src" == *:* ]]; then
+        # Download: vm:path -> local
+        name="${src%%:*}"
+        remote_path="${src#*:}"
+        local_path="$dst"
+        direction="download"
+    elif [[ "$dst" == *:* ]]; then
+        # Upload: local -> vm:path
+        name="${dst%%:*}"
+        remote_path="${dst#*:}"
+        local_path="$src"
+        direction="upload"
+    else
+        die "One of src/dst must be <vm-name>:<path>"
+    fi
+
+    _resolve_vm "$name"
+    _resolve_ssh_key "$_VM_DIR"
+    trap '_cleanup_ssh_key' EXIT INT TERM
+
+    # Use ssh+tar for transfer (doesn't need scp/sftp binaries in the VM)
+    if [[ "$direction" == "upload" ]]; then
+        [[ -e "$local_path" ]] || die "Local path does not exist: $local_path"
+        local base dir
+        base=$(basename "$local_path")
+        dir=$(dirname "$local_path")
+        tar -C "$dir" -cf - "$base" | \
+            ip netns exec "$_VM_NS" ssh -i "$_SSH_KEY_PATH" "${SSH_OPTS[@]}" \
+                "agent@${_VM_IP}" "tar -C '${remote_path%/*}' -xf - && [ -d '${remote_path%/*}/$base' ] || mv '${remote_path%/*}/$base' '$remote_path' 2>/dev/null; true"
+    else
+        ip netns exec "$_VM_NS" ssh -i "$_SSH_KEY_PATH" "${SSH_OPTS[@]}" \
+            "agent@${_VM_IP}" "tar -cf - -C '$(dirname "$remote_path")' '$(basename "$remote_path")'" | \
+            tar -C "$(dirname "$local_path")" -xf -
+        # Rename if target name differs from source basename
+        local extracted="$(dirname "$local_path")/$(basename "$remote_path")"
+        if [[ "$extracted" != "$local_path" ]] && [[ -e "$extracted" ]]; then
+            mv "$extracted" "$local_path"
+        fi
+    fi
+    local rc=$?
+    _cleanup_ssh_key
+    trap - EXIT INT TERM
+    return $rc
+}
+
+cmd_status() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: $PROG status <vm-name>"
+
+    require_root
+
+    local vm_dir="${VMS_DIR}/${name}"
+    local meta="${vm_dir}/vm.meta"
+    [[ -f "$meta" ]] || die "VM '$name' not found"
+
+    echo "${BOLD}VM: ${name}${RESET}"
+    echo ""
+
+    # Pretty-print metadata
+    jq -r '
+        "  Server:     \(.server_hostname) (\(.server_city), \(.server_country))",
+        "  Endpoint:   \(.server_endpoint)",
+        "  VM IP:      \(.vm_ip)",
+        "  TAP:        \(.tap_name) (\(.tap_addr))",
+        "  Namespace:  \(.namespace)",
+        "  WG Iface:   \(.wg_iface)",
+        "  RAM:        \(.ram)M",
+        "  CPUs:       \(.cpus)",
+        "  Started:    \(.started_at)",
+        if .inference != null then
+            "  Inference:  \(.inference.vm_endpoint) -> \(.inference.host):\(.inference.port)",
+            "  Veth:       \(.inference.veth_ns) (ns) <-> \(.inference.veth_host) (host)",
+            "  Veth IPs:   \(.inference.veth_ns_ip)/30 <-> \(.inference.veth_host_ip)/30"
+        else empty end
+    ' "$meta"
+
+    local ns
+    ns=$(jq -r '.namespace' "$meta")
+
+    echo ""
+    echo "${BOLD}WireGuard Status:${RESET}"
+    # WG is in root namespace
+    wg show "$(jq -r '.wg_iface' "$meta")" 2>/dev/null || echo "  (interface not found)"
+
+    echo ""
+    echo "${BOLD}nftables Rules:${RESET}"
+    ip netns exec "$ns" nft list ruleset 2>/dev/null | head -40 || echo "  (no rules)"
+}
+
+cmd_cleanup() {
+    require_root
+    info "Cleaning up stale resources..."
+    local stale=0
+
+    # Stale namespaces
+    for ns in $(ip netns list 2>/dev/null | grep "^${NS_PREFIX}-" | awk '{print $1}'); do
+        local vm_name="${ns#${NS_PREFIX}-}"
+        if [[ ! -d "${VMS_DIR}/${vm_name}" ]]; then
+            info "Removing stale namespace: $ns"
+            ip netns exec "$ns" nft flush ruleset 2>/dev/null || true
+            ip netns delete "$ns" 2>/dev/null || true
+            stale=$((stale + 1))
+        fi
+    done
+
+    # Stale WG interfaces in root
+    for iface in $(ip link show type wireguard 2>/dev/null | grep -oP 'wg-\S+(?=:)'); do
+        local vm_name="${iface#wg-}"
+        if [[ ! -d "${VMS_DIR}/${vm_name}" ]]; then
+            info "Removing stale WG interface: $iface"
+            ip link delete "$iface" 2>/dev/null || true
+            stale=$((stale + 1))
+        fi
+    done
+
+    # Stale veth interfaces
+    for iface in $(ip link show type veth 2>/dev/null | grep -oP 've\d+host(?=[@:])'); do
+        local idx="${iface#ve}"; idx="${idx%host}"
+        local found=0
+        for meta in "$VMS_DIR"/*/vm.meta; do
+            [[ -f "$meta" ]] && [[ "$(jq -r '.veth_host // empty' "$meta" 2>/dev/null)" == "$iface" ]] && found=1 && break
+        done
+        if [[ $found -eq 0 ]]; then
+            info "Removing stale veth: $iface"
+            ip link delete "$iface" 2>/dev/null || true
+            stale=$((stale + 1))
+        fi
+    done
+
+    # Stale policy routing rules — only touch rules at paranoid's priority range (1001-1254)
+    while read -r _ _ prio _ _ _ tbl; do
+        [[ "$prio" =~ ^[0-9]+$ && "$tbl" =~ ^[0-9]+$ ]] || continue
+        (( prio >= 1001 && prio <= 1254 )) || continue
+        local found=0
+        for meta in "$VMS_DIR"/*/vm.meta; do
+            [[ -f "$meta" ]] && [[ "$(jq -r '.rt_table // empty' "$meta" 2>/dev/null)" == "$tbl" ]] && found=1 && break
+        done
+        if [[ $found -eq 0 ]]; then
+            info "Removing stale routing rule: priority $prio table $tbl"
+            ip rule del priority "$prio" 2>/dev/null || true
+            ip route flush table "$tbl" 2>/dev/null || true
+            stale=$((stale + 1))
+        fi
+    done < <(ip rule list 2>/dev/null)
+
+    # Stale VM dirs (namespace gone)
+    for vm_dir in "$VMS_DIR"/*/; do
+        [[ -d "$vm_dir" ]] || continue
+        local name; name=$(basename "$vm_dir")
+        local meta="${vm_dir}/vm.meta"
+        if [[ ! -f "$meta" ]]; then
+            _destroy_secrets_tmpfs "${vm_dir}/.secrets"
+            rm -rf "$vm_dir"
+            stale=$((stale + 1))
+            continue
+        fi
+
+        local ns; ns=$(jq -r '.namespace // ""' "$meta")
+        if [[ -n "$ns" ]] && ! ip netns list 2>/dev/null | grep -q "^${ns}"; then
+            _teardown_host_rules "$name"
+            _teardown_host_rules "${name}-inf"
+            local sv sr
+            sv=$(jq -r '.veth_host // empty' "$meta" 2>/dev/null)
+            sr=$(jq -r '.rt_table // empty' "$meta" 2>/dev/null)
+            [[ -n "$sv" ]] && ip link delete "$sv" 2>/dev/null || true
+            [[ -n "$sr" ]] && { ip rule del table "$sr" 2>/dev/null; ip route flush table "$sr" 2>/dev/null; } || true
+            local wi; wi=$(jq -r '.wg_iface // empty' "$meta" 2>/dev/null)
+            [[ -n "$wi" ]] && ip link delete "$wi" 2>/dev/null || true
+            _destroy_secrets_tmpfs "${vm_dir}/.secrets"
+            info "Removing stale VM: $name"
+            rm -rf "$vm_dir"
+            stale=$((stale + 1))
+        fi
+    done
+
+    # Stale iptables/ip6tables rules
+    for vm_comment in $(iptables-save 2>/dev/null | grep -oP 'paranoid-[^ "]+' | sort -u); do
+        local rule_vm="${vm_comment#paranoid-}"; rule_vm="${rule_vm%-inf}"
+        if [[ ! -d "${VMS_DIR}/${rule_vm}" ]]; then
+            _teardown_host_rules "${vm_comment#paranoid-}"
+            stale=$((stale + 1))
+        fi
+    done
+
+    [[ $stale -eq 0 ]] && info "Nothing to clean up" || info "Cleaned up $stale stale resources"
+}
+
+cmd_reset() {
+    require_root
+    warn "This will destroy ALL paranoid data: vault, credentials, VMs, base image."
+    if [[ "${1:-}" != "--force" ]]; then
+        read -rp "${BOLD}Type 'reset' to confirm: ${RESET}" confirm </dev/tty
+        [[ "$confirm" == "reset" ]] || die "Aborted"
+    fi
+
+    # Disable exit-on-error for the nuke sequence
+    set +e
+
+    # Kill all QEMU + control plane processes
+    for pidfile in "$VMS_DIR"/*/qemu.pid "$VMS_DIR"/*/vm.pid "$VMS_DIR"/*/controlplane.pid; do
+        [[ -f "$pidfile" ]] || continue
+        local pid; pid=$(cat "$pidfile" 2>/dev/null)
+        [[ -n "$pid" ]] && { kill "$pid" 2>/dev/null; kill -9 "$pid" 2>/dev/null; }
+    done
+
+    # Tear down all paranoid namespaces
+    for ns in $(ip netns list 2>/dev/null | grep "^${NS_PREFIX}-" | awk '{print $1}'); do
+        ip netns exec "$ns" nft flush ruleset 2>/dev/null || true
+        ip netns delete "$ns" 2>/dev/null || true
+    done
+
+    # Delete all paranoid WG interfaces
+    for iface in $(ip link show type wireguard 2>/dev/null | grep -oP 'wg-\S+(?=:)'); do
+        ip link delete "$iface" 2>/dev/null || true
+    done
+
+    # Delete all paranoid veth interfaces
+    for iface in $(ip link show type veth 2>/dev/null | grep -oP 've\d+host(?=[@:])'); do
+        ip link delete "$iface" 2>/dev/null || true
+    done
+
+    # Flush iptables rules
+    iptables-save -t filter 2>/dev/null | grep "paranoid-" | sed 's/-A /-D /' | \
+        while IFS= read -r rule; do iptables $rule 2>/dev/null || true; done
+    iptables-save -t nat 2>/dev/null | grep "paranoid-" | sed 's/-A /-D /' | \
+        while IFS= read -r rule; do iptables -t nat $rule 2>/dev/null || true; done
+    ip6tables-save -t filter 2>/dev/null | grep "paranoid-" | sed 's/-A /-D /' | \
+        while IFS= read -r rule; do ip6tables $rule 2>/dev/null || true; done
+
+    # Flush only paranoid-owned policy routing (priority 1001-1254)
+    while read -r _ _ prio _ _ _ tbl; do
+        [[ "$prio" =~ ^[0-9]+$ && "$tbl" =~ ^[0-9]+$ ]] || continue
+        (( prio >= 1001 && prio <= 1254 )) || continue
+        ip rule del priority "$prio" 2>/dev/null
+        ip route flush table "$tbl" 2>/dev/null
+    done < <(ip rule list 2>/dev/null) || true
+
+    # Unmount secrets tmpfs and remove all data
+    for d in "$VMS_DIR"/*/; do
+        [[ -d "$d" ]] && umount "${d}.secrets" 2>/dev/null || true
+    done
+    rm -rf "$DATA_DIR"
+    rm -rf "$CONFIG_DIR"
+
+    set -e
+    info "All paranoid data removed. Run '$PROG setup' to start fresh."
+}
+
+# --- Main ---
+
+usage() {
+    cat << EOF
+${BOLD}${PROG}${RESET} v${VERSION} — QEMU microVM agent sandboxes with WireGuard isolation
+
+${BOLD}USAGE:${RESET}
+    sudo ${PROG} <command> [options]
+
+${BOLD}COMMANDS:${RESET}
+    setup [--mullvad-account <16-digit>]  One-time setup (auto-registers WG key with Mullvad)
+    start [options]                 Launch a new VM
+        --name <name>               VM name (default: auto-generated)
+        --location <country_code>   Mullvad server country (us, de, gb, jp, ...)
+        --ram <MB>                  RAM in MB (default: ${DEFAULT_RAM})
+        --cpus <N>                  CPU count (default: ${DEFAULT_CPUS})
+        --detach, -d                Run in background (no serial console)
+        --local-inference <ip:port> Pinhole to a LAN inference API (zero LAN leak)
+        --sev                       Enable AMD SEV memory encryption (EPYC only)
+        --auto-rotate <minutes>     Auto-rotate WG endpoint every N minutes
+        --max-cpu <percent>         CPU limit (100=1 core, 200=2 cores, cgroup v2)
+        --max-mem <MB>              Memory limit in MB (cgroup v2, 0=unlimited)
+    stop <name> [--destroy]         Stop VM (disk preserved by default, --destroy wipes it)
+    rotate <name> [--location <cc>] Hot-swap WireGuard endpoint (no VM restart)
+    list                            List running VMs
+    ssh <name>                      SSH into a VM
+    exec <name> -- <cmd>            Run a command in the VM via SSH
+    cp <src> <dst>                  Copy files (use vm:<path> for VM side)
+    status <name>                   Show detailed VM status
+    cleanup                         Remove stale namespaces/resources
+    reset [--force]                 Destroy all data and start fresh
+
+${BOLD}ENCRYPTION:${RESET}
+    Disk:    LUKS (AES-256-XTS) on all VM overlay images
+    Network: WireGuard (ChaCha20-Poly1305) tunnel
+    Secrets: AES-256-CBC encrypted at rest (mullvad key, SSH keys)
+    Vault:   Master key protected by passphrase (PBKDF2, ${KDF_ITER} iter)
+    Memory:  AMD SEV (optional, --sev flag, requires EPYC CPU)
+
+${BOLD}ENVIRONMENT:${RESET}
+    PARANOID_DEBUG=1                Enable debug output
+    PARANOID_PASSPHRASE=<pass>      Vault passphrase (avoids interactive prompt)
+
+${BOLD}FILES:${RESET}
+    ~/.config/paranoid/mullvad.conf Mullvad WireGuard credentials
+    ~/.config/paranoid/servers.json Cached server list
+    ~/.local/share/paranoid/        VM images and state
+
+${BOLD}EXAMPLES:${RESET}
+    sudo ${PROG} setup --mullvad-account 1234567890123456
+    sudo ${PROG} start --name myvm --location us --detach
+    sudo ${PROG} start --name aivm --local-inference 192.168.1.50:11434 -d
+    sudo ${PROG} ssh myvm
+    sudo ${PROG} rotate myvm --location de
+    sudo ${PROG} stop myvm
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        setup)    cmd_setup "$@" ;;
+        start)    cmd_start "$@" ;;
+        stop)     cmd_stop "$@" ;;
+        rotate)   cmd_rotate "$@" ;;
+        list|ls)  cmd_list "$@" ;;
+        ssh)      cmd_ssh "$@" ;;
+        exec)     cmd_exec "$@" ;;
+        cp)       cmd_cp "$@" ;;
+        status)   cmd_status "$@" ;;
+        cleanup)  cmd_cleanup "$@" ;;
+        reset)    cmd_reset "$@" ;;
+        help|-h|--help) usage ;;
+        version|-v|--version) echo "$PROG $VERSION" ;;
+        "")       usage; exit 1 ;;
+        *)        die "Unknown command: $cmd (try '$PROG help')" ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""paranoid control plane — lightweight HTTP API for VM-side WireGuard management.
+
+Runs inside the network namespace, bound to the TAP gateway IP.
+The VM can curl it to view status, list locations, and rotate WG endpoints.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
+
+# Globals set at startup
+WG_IFACE = ""
+META_PATH = ""
+SERVERS_PATH = ""
+WG_NETNS = ""  # "root" = WG is in root netns, reach it via nsenter
+
+# Auto-rotation state
+_auto_rotate_timer = None
+_auto_rotate_interval = 0  # minutes, 0 = disabled
+_auto_rotate_lock = threading.Lock()
+_rotate_lock = threading.Lock()  # serializes all rotation operations
+
+
+def _wg_prefix():
+    if WG_NETNS == "root":
+        return ["nsenter", "-t", "1", "-n", "--"]
+    return []
+
+def read_meta():
+    with open(META_PATH) as f:
+        return json.load(f)
+
+def write_meta(data):
+    tmp = META_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=4)
+    os.rename(tmp, META_PATH)
+
+def wg_show_safe():
+    """Query WG status using targeted commands — NEVER reads the private key."""
+    prefix = _wg_prefix()
+    def _run(subcmd):
+        try:
+            r = subprocess.run(prefix + ["wg", "show", WG_IFACE, subcmd],
+                               capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    result = {
+        "public_key": _run("public-key"),
+        "listen_port": _run("listen-port"),
+        "peers": []
+    }
+
+    # Parse endpoints, handshakes, transfer per peer
+    endpoints = _run("endpoints")
+    handshakes = _run("latest-handshakes")
+    transfer = _run("transfer")
+
+    # Build peer map keyed by pubkey
+    peers = {}
+    for line in endpoints.split("\n"):
+        parts = line.split("\t")
+        if len(parts) == 2:
+            peers[parts[0]] = {"public_key": parts[0], "endpoint": parts[1]}
+    for line in handshakes.split("\n"):
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[0] in peers:
+            epoch = int(parts[1]) if parts[1] != "0" else 0
+            peers[parts[0]]["latest_handshake_epoch"] = epoch
+            peers[parts[0]]["latest_handshake"] = (
+                datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+                if epoch > 0 else None
+            )
+    for line in transfer.split("\n"):
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0] in peers:
+            peers[parts[0]]["transfer_rx"] = int(parts[1])
+            peers[parts[0]]["transfer_tx"] = int(parts[2])
+
+    result["peers"] = list(peers.values())
+    return result if result["public_key"] else None
+
+def human_bytes(n):
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+def load_servers():
+    try:
+        with open(SERVERS_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def pick_server(servers, country=None, exclude_hostname=None):
+    """Pick a random active server, optionally filtered by country."""
+    import random
+    candidates = [s for s in servers if s.get("active", False)]
+    if country:
+        candidates = [s for s in candidates if s.get("country_code") == country]
+    if exclude_hostname:
+        candidates = [s for s in candidates if s.get("hostname") != exclude_hostname]
+    if not candidates:
+        return None
+    return random.choice(candidates)
+
+def do_rotate(location=None):
+    with _rotate_lock:
+        return _do_rotate_inner(location)
+
+def _do_rotate_inner(location=None):
+    # Hold file lock for the entire operation (read + wg change + write)
+    lock_path = META_PATH + ".lock"
+    lock_fd = open(lock_path, "w")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        return _do_rotate_locked(location)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+def _do_rotate_locked(location=None):
+    meta = read_meta()
+    current_hostname = meta.get("server_hostname", "")
+
+    servers = load_servers()
+    if not servers:
+        raise ValueError("No server list available")
+
+    new_server = pick_server(servers, country=location, exclude_hostname=current_hostname)
+    if not new_server:
+        raise ValueError(f"No servers found{' for ' + location if location else ''}")
+
+    new_ip = new_server['ipv4_addr_in']
+    new_pubkey = new_server["pubkey"]
+
+    # Validate (prevent injection via tampered servers.json)
+    if not re.match(r'^\d+\.\d+\.\d+\.\d+$', new_ip):
+        raise ValueError(f"Invalid server IP: {new_ip}")
+    if not re.match(r'^[A-Za-z0-9+/]{43}=$', new_pubkey):
+        raise ValueError(f"Invalid server pubkey format")
+
+    new_endpoint = f"{new_ip}:51820"
+
+    # Remove old peer, add new (wg syncconf would wipe private key)
+    old_pubkey = meta.get("server_pubkey", "")
+    prefix = _wg_prefix()
+    if old_pubkey:
+        subprocess.run(prefix + ["wg", "set", WG_IFACE, "peer", old_pubkey, "remove"],
+                       capture_output=True, timeout=5)
+    result = subprocess.run(
+        prefix + ["wg", "set", WG_IFACE,
+                  "peer", new_pubkey,
+                  "endpoint", new_endpoint,
+                  "allowed-ips", "0.0.0.0/0",
+                  "persistent-keepalive", "25"],
+        capture_output=True, text=True, timeout=10
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"wg set peer failed: {result.stderr}")
+
+    prev = {
+        "hostname": current_hostname,
+        "country": meta.get("server_country", ""),
+        "city": meta.get("server_city", ""),
+    }
+    current = {
+        "hostname": new_server["hostname"],
+        "country": new_server["country_code"],
+        "city": new_server.get("city_name", ""),
+        "endpoint": new_endpoint,
+    }
+
+    # Re-read meta (we hold the lock, so it's authoritative) and update atomically
+    meta = read_meta()
+    meta["server_hostname"] = new_server["hostname"]
+    meta["server_country"] = new_server["country_code"]
+    meta["server_city"] = new_server.get("city_name", "")
+    meta["server_endpoint"] = new_endpoint
+    meta["server_pubkey"] = new_pubkey
+    write_meta(meta)
+
+    return prev, current
+
+
+
+def _auto_rotate_tick():
+    """Called by timer thread to perform one rotation."""
+    global _auto_rotate_timer
+    try:
+        prev, current = do_rotate()
+        sys.stderr.write(
+            f"[auto-rotate] {prev['hostname']} -> {current['hostname']} "
+            f"({current['city']}, {current['country']})\n"
+        )
+    except Exception as e:
+        sys.stderr.write(f"[auto-rotate] failed: {e}\n")
+
+    # Reschedule
+    with _auto_rotate_lock:
+        if _auto_rotate_interval > 0:
+            _auto_rotate_timer = threading.Timer(_auto_rotate_interval * 60, _auto_rotate_tick)
+            _auto_rotate_timer.daemon = True
+            _auto_rotate_timer.start()
+
+def auto_rotate_set(interval_minutes):
+    """Set or disable auto-rotation. 0 disables."""
+    global _auto_rotate_timer, _auto_rotate_interval
+    with _auto_rotate_lock:
+        # Cancel existing timer
+        if _auto_rotate_timer is not None:
+            _auto_rotate_timer.cancel()
+            _auto_rotate_timer = None
+
+        _auto_rotate_interval = interval_minutes
+        if interval_minutes > 0:
+            _auto_rotate_timer = threading.Timer(interval_minutes * 60, _auto_rotate_tick)
+            _auto_rotate_timer.daemon = True
+            _auto_rotate_timer.start()
+            sys.stderr.write(f"[auto-rotate] enabled: every {interval_minutes}m\n")
+        else:
+            sys.stderr.write("[auto-rotate] disabled\n")
+
+def auto_rotate_status():
+    with _auto_rotate_lock:
+        return {
+            "enabled": _auto_rotate_interval > 0,
+            "interval_minutes": _auto_rotate_interval,
+        }
+
+
+
+MAX_BODY = 4096  # max request body size
+
+class ControlHandler(BaseHTTPRequestHandler):
+    timeout = 30  # seconds per request
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write(f"[controlplane] {args[0]}\n")
+
+    def _read_body(self, max_size=MAX_BODY):
+        """Read request body with size limit."""
+        length = int(self.headers.get("Content-Length", 0))
+        if length > max_size:
+            return None  # caller should return 413
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
+    def _json_response(self, code, data):
+        body = json.dumps(data, indent=2).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/status":
+            self._handle_status()
+        elif self.path == "/locations":
+            self._handle_locations()
+        elif self.path == "/auto-rotate":
+            self._json_response(200, auto_rotate_status())
+        elif self.path == "/health":
+            self._json_response(200, {"ok": True})
+        else:
+            self._json_response(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path == "/rotate":
+            self._handle_rotate()
+        elif self.path == "/auto-rotate":
+            self._handle_auto_rotate()
+        else:
+            self._json_response(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        if self.path == "/auto-rotate":
+            auto_rotate_set(0)
+            self._json_response(200, {"enabled": False})
+        else:
+            self._json_response(404, {"error": "not found"})
+
+    def _handle_status(self):
+        meta = read_meta()
+        wg = wg_show_safe()
+
+        peer_info = {}
+        wg_health = "unknown"
+        if wg and wg["peers"]:
+            p = wg["peers"][0]
+            peer_info = {
+                "endpoint": p["endpoint"],
+                "latest_handshake": p["latest_handshake"],
+                "transfer_rx": human_bytes(p["transfer_rx"]),
+                "transfer_tx": human_bytes(p["transfer_tx"]),
+                "transfer_rx_bytes": p["transfer_rx"],
+                "transfer_tx_bytes": p["transfer_tx"],
+            }
+            # WG health: based on last handshake age
+            hs = p["latest_handshake_epoch"]
+            if hs == 0:
+                wg_health = "no_handshake"
+            elif time.time() - hs < 180:
+                wg_health = "connected"
+            elif time.time() - hs < 600:
+                wg_health = "stale"
+            else:
+                wg_health = "disconnected"
+
+        started = meta.get("started_at_epoch", 0)
+        uptime = int(time.time() - started) if started else 0
+
+        self._json_response(200, {
+            "server": {
+                "hostname": meta.get("server_hostname", ""),
+                "city": meta.get("server_city", ""),
+                "country": meta.get("server_country", ""),
+                "endpoint": meta.get("server_endpoint", ""),
+            },
+            "wireguard": {
+                "interface": WG_IFACE,
+                "public_key": wg["public_key"] if wg else "",
+                "health": wg_health,
+                **peer_info,
+            },
+            "auto_rotate": auto_rotate_status(),
+            "uptime_seconds": uptime,
+            "encryption": {
+                "disk": "LUKS/AES-256-XTS",
+                "network": "WireGuard/ChaCha20-Poly1305",
+            },
+        })
+
+    def _handle_locations(self):
+        servers = load_servers()
+        cache_mtime = os.path.getmtime(SERVERS_PATH) if os.path.exists(SERVERS_PATH) else 0
+        cache_age = int(time.time() - cache_mtime)
+
+        # Aggregate by country
+        countries = {}
+        for s in servers:
+            if not s.get("active", False):
+                continue
+            cc = s.get("country_code", "??")
+            if cc not in countries:
+                countries[cc] = {
+                    "code": cc,
+                    "name": s.get("country_name", cc),
+                    "cities": set(),
+                    "server_count": 0,
+                }
+            countries[cc]["cities"].add(s.get("city_name", ""))
+            countries[cc]["server_count"] += 1
+
+        result = []
+        for cc in sorted(countries):
+            c = countries[cc]
+            result.append({
+                "code": c["code"],
+                "name": c["name"],
+                "cities": sorted(c["cities"]),
+                "server_count": c["server_count"],
+            })
+
+        total = sum(c["server_count"] for c in result)
+        self._json_response(200, {
+            "countries": result,
+            "total_servers": total,
+            "cache_age_seconds": cache_age,
+            "stale": cache_age > 86400,
+        })
+
+    def _handle_rotate(self):
+        # Parse optional JSON body
+        location = None
+        raw = self._read_body()
+        if raw is None:
+            self._json_response(413, {"error": "request body too large"})
+            return
+        if raw:
+            try:
+                body = json.loads(raw)
+                location = body.get("location")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._json_response(400, {"error": "invalid JSON"})
+                return
+
+        # Validate location
+        if location is not None:
+            if not re.match(r"^[a-z]{2}$", location):
+                self._json_response(400, {
+                    "error": f"invalid location '{location}' — use 2-letter country code (us, de, gb, jp, ...)"
+                })
+                return
+
+        try:
+            prev, current = do_rotate(location)
+            self._json_response(200, {
+                "previous": prev,
+                "current": current,
+                "rotated_at": datetime.now(tz=timezone.utc).isoformat(),
+            })
+        except ValueError as e:
+            self._json_response(404, {"error": str(e)})
+        except RuntimeError as e:
+            self._json_response(500, {"error": str(e)})
+
+    def _handle_auto_rotate(self):
+        raw = self._read_body()
+        if raw is None:
+            self._json_response(413, {"error": "request body too large"})
+            return
+        if not raw:
+            self._json_response(400, {"error": "need JSON body with interval_minutes"})
+            return
+        try:
+            body = json.loads(raw)
+            minutes = int(body.get("interval_minutes", 0))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            self._json_response(400, {"error": "invalid JSON — need {\"interval_minutes\": N}"})
+            return
+
+        if minutes < 0 or minutes > 1440:
+            self._json_response(400, {"error": "interval_minutes must be 0-1440"})
+            return
+
+        auto_rotate_set(minutes)
+        self._json_response(200, auto_rotate_status())
+
+
+
+def main():
+    global WG_IFACE, META_PATH, SERVERS_PATH, WG_NETNS
+
+    parser = argparse.ArgumentParser(description="paranoid control plane")
+    parser.add_argument("--bind", required=True, help="IP to bind to")
+    parser.add_argument("--port", type=int, default=9111, help="Port to listen on")
+    parser.add_argument("--meta", required=True, help="Path to vm.meta")
+    parser.add_argument("--servers", required=True, help="Path to servers.json")
+    parser.add_argument("--wg-iface", required=True, help="WireGuard interface name")
+    parser.add_argument("--auto-rotate", type=int, default=0, metavar="MINUTES",
+                        help="Auto-rotate WG endpoint every N minutes (0=disabled)")
+    parser.add_argument("--wg-netns", default="",
+                        help="WG interface network namespace ('root' if WG is in root netns)")
+    args = parser.parse_args()
+
+    WG_IFACE = args.wg_iface
+    META_PATH = args.meta
+    SERVERS_PATH = args.servers
+    WG_NETNS = args.wg_netns
+
+
+    # Graceful shutdown
+    def handle_signal(signum, frame):
+        sys.stderr.write(f"[controlplane] caught signal {signum}, shutting down\n")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    # Start auto-rotation if requested
+    if args.auto_rotate > 0:
+        auto_rotate_set(args.auto_rotate)
+
+    server = ThreadingHTTPServer((args.bind, args.port), ControlHandler)
+    server.daemon_threads = True
+    sys.stderr.write(f"[controlplane] listening on {args.bind}:{args.port}\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+if __name__ == "__main__":
+    main()
