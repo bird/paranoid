@@ -959,8 +959,9 @@ if [ -n "$vm_ip" ] && [ -n "$vm_gw" ]; then
     echo "micro-init: eth0 configuration failed (no NIC?)"
 fi
 
-# DNS
+# DNS (remove immutable flag first — may be set from previous boot)
 if [ -n "$vm_dns" ]; then
+    chattr -i /etc/resolv.conf 2>/dev/null
     echo "nameserver $vm_dns" > /etc/resolv.conf
 fi
 
