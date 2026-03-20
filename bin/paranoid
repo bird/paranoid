@@ -1490,8 +1490,8 @@ cmd_start() {
 
     mkdir -p "$vm_dir"
 
-    # Set up trap for cleanup
-    trap "cleanup_on_exit '$name'" INT TERM
+    # Clean up on any failure (INT, TERM, or die/set -e)
+    trap "cleanup_on_exit '$name'" INT TERM EXIT
 
     # Pick a server
     info "Selecting Mullvad server${location:+ in $location}..."
@@ -1806,7 +1806,9 @@ EOF
     _start_controlplane "$ns" "$tap_addr_bare" "${vm_dir}/vm.meta" \
         "$wg_iface" "$vm_dir" "$auto_rotate"
 
-    # Launch QEMU
+    # Success — disable cleanup trap before launching QEMU
+    trap - EXIT
+
     PARANOID_DETACH="$detach" _launch_qemu \
         "$name" "$ns" "$tap_name" "$ram" "$cpus" \
         "${vm_dir}/overlay.qcow2" "$vm_ip" "$tap_addr_bare" \
