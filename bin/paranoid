@@ -484,9 +484,16 @@ _pick_server() {
         jq_filter="${jq_filter} | [.[] | select(.hostname != \$ex)]"
     fi
 
+    [[ -f "$SERVERS_CACHE" ]] || die "Server cache not found: $SERVERS_CACHE"
+    [[ -s "$SERVERS_CACHE" ]] || die "Server cache is empty: $SERVERS_CACHE"
+
     # Get count first
     local count
-    count=$(jq "${jq_args[@]}" "${jq_filter} | length" "$SERVERS_CACHE")
+    if ! count=$(jq "${jq_args[@]}" "${jq_filter} | length" "$SERVERS_CACHE" 2>&1); then
+        die "jq failed parsing $SERVERS_CACHE: $count"
+    fi
+
+    [[ "$count" =~ ^[0-9]+$ ]] || die "Invalid server count '$count' (servers.json may be corrupt)"
 
     if [[ "$count" -eq 0 ]]; then
         die "No servers found${country:+ for country '$country'}${exclude:+ excluding '$exclude'}"
